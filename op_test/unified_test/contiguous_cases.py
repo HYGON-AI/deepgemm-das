@@ -1,0 +1,33 @@
+CASES = [
+    # name     experts size_n size_k total_m
+    ("contiguous_", 16, 2048, 3584, 128),
+    ("contiguous_", 16, 2048, 3584, 512),
+    ("contiguous_", 16, 2048, 3584, 1024),
+    ("contiguous_", 16, 2048, 3584, 2048),
+    ("contiguous_", 16, 2048, 3584, 4096),
+    ("contiguous_", 16, 2048, 3584, 131072),
+    ("contiguous_", 16, 2048, 3584, 262144),
+    ("contiguous_", 16, 3072, 3584, 128),
+    ("contiguous_", 16, 3072, 3584, 512),
+    ("contiguous_", 16, 3072, 3584, 1024),
+    ("contiguous_", 16, 3072, 3584, 2048),
+    ("contiguous_", 16, 3072, 3584, 4096),
+    ("contiguous_", 16, 3072, 3584, 131072),
+    ("contiguous_", 16, 3072, 3584, 262144),
+    ("contiguous_", 16, 4096, 6144, 128),
+    ("contiguous_", 16, 4096, 6144, 512),
+    ("contiguous_", 16, 4096, 6144, 1024),
+    ("contiguous_", 16, 4096, 6144, 2048),
+    ("contiguous_", 16, 4096, 6144, 4096),
+    ("contiguous_", 16, 4096, 6144, 131072),
+    ("contiguous_", 16, 4096, 6144, 262144),
+    ("contiguous_", 16, 6144, 2048, 128),
+    ("contiguous_", 16, 6144, 2048, 512),
+    ("contiguous_", 16, 6144, 2048, 1024),
+    ("contiguous_", 16, 6144, 2048, 2048),
+    ("contiguous_", 16, 6144, 2048, 4096),
+    ("contiguous_", 16, 6144, 2048, 131072),
+    ("contiguous_", 16, 6144, 2048, 262144),
+]
+
+correctness_check = False
