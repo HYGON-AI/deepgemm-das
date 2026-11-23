@@ -75,16 +75,3 @@ torch::Tensor group_gemm_wfp4a16_contiguous(
   TORCH_CHECK(false, "WFP4A16 contiguous supports gfx936/gfx938 only, got ", arch);
   return matrix_c;
 }
-
-TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
-  m.def(
-      "m_grouped_wfp4a16_gemm_nt_contiguous("
-      "Tensor matrix_a, "
-      "Tensor matrix_b, "
-      "Tensor matrix_c, "
-      "Tensor matrix_b_scale, "
-      "Tensor m_indices "
-      ") -> (Tensor)"
-  );
-  m.impl("m_grouped_wfp4a16_gemm_nt_contiguous", torch::kCUDA, &group_gemm_wfp4a16_contiguous);
-}

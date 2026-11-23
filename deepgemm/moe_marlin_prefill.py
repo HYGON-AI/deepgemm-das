@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from . import op
 from .print_size import PRINT_SIZE_ENABLED, print_moe_prefill_size
 
 __all__ = [
@@ -41,7 +42,7 @@ def moe_w8a8_marlin_prefill_down_fp8(
             top_k,
             real_topk,
         )
-    return torch.ops.deep_gemm.moe_w8a8_marlin_prefill_down_fp8(
+    return op.moe_w8a8_marlin_prefill_down_fp8(
         input,
         b_qweight,
         output,

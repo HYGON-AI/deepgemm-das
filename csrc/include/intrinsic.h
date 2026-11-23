@@ -418,7 +418,7 @@ __forceinline__ __device__ void matrix_load_b16_lds_builtin(size_t lds_addr_warp
 
 template<int INSTM, int INSTNM, int T, int R>
 __forceinline__ __device__ void matrix_load_b16_lds_trans_builtin(size_t lds_addr_warp, uintx4 rsrc, int moffset) {
-  #if defined(__gfx938__)
+  #if defined(__gfx938__) || defined(__gfx92a__)
     int soffset = lds_addr_warp + 0x80000000;
     if constexpr (INSTM == 32 && INSTNM == 16)
         __builtin_hcu_matrix_load_32x16_b16(rsrc, (__attribute__((address_space(3))) short*)(soffset), 0, T, R, 0, 0);
@@ -461,7 +461,7 @@ __forceinline__ __device__ void matrix_load_b8_lds(DataType* lds_ptr, uintx4 rsr
 
 template<int INSTM, int INSTNM, int T, int R, class DataType>
 __forceinline__ __device__ void matrix_load_b16_lds_trans(DataType* lds_ptr, uintx4 rsrc, int& lds_offset, const int moffset) {
-    #if defined(__gfx938__)
+    #if defined(__gfx938__) || defined(__gfx92a__)
         size_t lds_addr_warp = reinterpret_cast<size_t>(lds_ptr) + lds_offset;
         if constexpr (T && R)
             matrix_load_b16_lds_trans_builtin<INSTM, INSTNM, T, R>(lds_addr_warp, rsrc, moffset);

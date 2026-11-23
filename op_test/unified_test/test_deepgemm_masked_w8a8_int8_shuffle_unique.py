@@ -78,7 +78,7 @@ def run_case(name, experts, size_m, size_n, size_k, active_m, seed):
     )
     torch.cuda.synchronize()
 
-    return
+    # return
 
     max_err = 0.0
     for expert in range(experts):

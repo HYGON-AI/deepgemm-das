@@ -45,7 +45,7 @@ def run_case(name, experts, size_m, size_n, size_k, active_m, seed):
 
     a = (torch.randn(experts, size_m, size_k, device="cuda") * 0.1).to(torch.bfloat16)
     weight = (torch.randn(experts, size_n, size_k, device="cuda") * 0.1).to(torch.bfloat16)
-    packed_weight, config = pack_bf16_masked_weight(weight)
+    packed_weight = pack_bf16_masked_weight(weight)
     masked_m = torch.full((experts,), active_m, device="cuda", dtype=torch.int32)
     output = torch.zeros(experts, size_m, size_n, device="cuda", dtype=torch.bfloat16)
 
@@ -54,8 +54,7 @@ def run_case(name, experts, size_m, size_n, size_k, active_m, seed):
         packed_weight,
         output,
         masked_m,
-        active_m,
-        config,
+        active_m
     )
     torch.cuda.synchronize()
 
@@ -76,7 +75,6 @@ def run_case(name, experts, size_m, size_n, size_k, active_m, seed):
             output,
             masked_m,
             active_m,
-            config,
         )
     )
     bytes_moved = _bytes_per_case(experts, size_m, size_n, size_k, active_m)

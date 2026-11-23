@@ -27,6 +27,7 @@ from deepgemm import (
     pack_w4a8_moe_hipc_weight,
 )
 from deepgemm.group_gemm_weight_pack import pack_w4a8_weight_k_contiguous
+from deepgemm.configs.contiguous import DEFAULT_W4A8_CONTIG_CONFIG
 
 
 def align(x: int, y: int) -> int:
@@ -113,6 +114,7 @@ def run_case(
     verify: bool = True,
     warmup: int = 20,
     iters: int = 100,
+    mode: int = DEFAULT_W4A8_CONTIG_CONFIG["MODE"],
 ) -> dict:
     data = _build_case(e, total_m, n, k, dtype)
     fn = lambda: m_grouped_w4a8_gemm_nt_contiguous_hipc(
@@ -120,6 +122,7 @@ def run_case(
         (data["packed_w"], data["w_scale"]),
         data["out"],
         data["m_indices"],
+        config={"MODE": mode},
     )
     fn()
     torch.cuda.synchronize()
@@ -191,6 +194,14 @@ def main() -> None:
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--mode", type=int, choices=[1002, 1006],
+        default=DEFAULT_W4A8_CONTIG_CONFIG["MODE"],
+        help=(
+            "1002: original HIPC; 1006: BM128/BN512/BK64 with device selection "
+            "of 16/32/64/128 rows (BF16 output, expert rows padded to 128)."
+        ),
+    )
     args = parser.parse_args()
 
     seed = 0
@@ -230,6 +241,7 @@ def main() -> None:
                     verify=not args.no_verify,
                     warmup=args.warmup,
                     iters=args.iters,
+                    mode=args.mode,
                 )
             except AssertionError:
                 if not args.no_verify:

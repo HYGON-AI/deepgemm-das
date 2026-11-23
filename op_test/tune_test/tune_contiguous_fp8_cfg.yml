@@ -1,0 +1,16 @@
+# All relative paths are resolved against this YAML file.
+# Persistent gfx938 pair32_v2: BM256/BN256, BM128/BN256, BM128/BN384.
+modes: [1000, 1001, 1002]
+cases: contiguous_fp8_cases.yml
+gpu: 0
+arch: gfx938
+warmup: 8
+iters: 50        # kernel calls per HIP graph
+replays: 20      # graph replays per measurement
+repeats: 5       # alternating candidate order; median across rounds
+out: contiguous_fp8.csv
+resume: false
+emit_config: true
+emit_only: false
+aggregate_only: false
+config_root: ../../deepgemm/configs

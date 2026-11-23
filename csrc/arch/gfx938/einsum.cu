@@ -137,11 +137,11 @@ void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     // Both engines share the deepgemm::fp8_gemm argument order, so the call
     // below is identical either way (see fp8_engine() above).
     if (fp8_engine() == Fp8Engine::kHipc) {
-        run_fp8_gemm_hipc(b, a, sfb, sfa, output,
+        ::gfx938::run_fp8_gemm_hipc(b, a, sfb, sfa, output,
                           n, m, k, batch_size, "TN",
                           alpha, beta, std::nullopt);
     } else {
-        deepgemm::fp8_gemm(b, a, sfb, sfa, output,
+        ::gfx938::deepgemm::fp8_gemm(b, a, sfb, sfa, output,
                            n, m, k, batch_size, "TN",
                            alpha, beta, std::nullopt);
     }

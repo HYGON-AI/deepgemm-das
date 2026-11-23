@@ -235,27 +235,7 @@ torch::Tensor m_grouped_bf16_gemm_nt_masked(
     return grouped_bf16_gemm_nt_masked_bm64_bn256_bk128::launch(
       input, b_qweight, output, masked_m, expected_m_per_group, mode);
   }
-  if (mode == 1000) {
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      output.scalar_type(), "m_groupgemm_bf16_TN_impl",[&] {
-        _m_grouped_bf16_gemm_nt_masked_asm_impl<256, 256, 64, scalar_t>(
-          input, b_qweight, output,
-          masked_m, expected_m_per_group, experts_num);
-      }
-    );
-  } else if(mode == 1001) {
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      output.scalar_type(), "m_groupgemm_bf16_TN_impl",[&] {
-        _m_grouped_bf16_gemm_nt_masked_asm_impl<256, 128, 128, scalar_t>(
-          input, b_qweight, output,
-          masked_m, expected_m_per_group, experts_num);
-      }
-    );
-  } else {
+  else {
     TORCH_CHECK(false, mode, " mode error.");
   }
   return output;

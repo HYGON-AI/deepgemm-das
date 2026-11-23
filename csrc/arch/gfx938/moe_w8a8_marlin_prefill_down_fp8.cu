@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// MoE Marlin W8A8 GEMM2 prefill-down FP8 — TORCH_LIBRARY_FRAGMENT in ``deep_gemm`` namespace.
+// MoE Marlin W8A8 GEMM2 prefill-down FP8 in the ``deep_gemm`` namespace.
 //
 // Exposes MOE_W8A8_I8_PERCHANNEL_MARLIN_HIP_NT_PREFILL_DOWN_FP8 (MoE Marlin routing API).
 
@@ -109,26 +109,3 @@ torch::Tensor moe_marlin_w8a8_gemm2_prefill_down_fp8(
 }
 
 } // namespace moe_marlin
-
-TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
-  m.def(
-      "moe_w8a8_marlin_prefill_down_fp8("
-      "Tensor input, "
-      "Tensor b_qweight, "
-      "Tensor output, "
-      "Tensor a_scale, "
-      "Tensor b_scale, "
-      "Tensor topk_weights, "
-      "Tensor sorted_token_ids, "
-      "Tensor expert_ids, "
-      "Tensor num_tokens_post_pad, "
-      "int top_k, "
-      "int real_topk"
-      ") -> Tensor");
-  m.impl(
-      "moe_w8a8_marlin_prefill_down_fp8",
-      torch::kCUDA,
-      &moe_marlin::moe_marlin_w8a8_gemm2_prefill_down_fp8);
-}
-
-

@@ -39,7 +39,7 @@ def deepgemm_masked_impl_fp8_ep_benchmark(input, input_scale, weight, weight_sca
     n_ll, k_ll, e_ll = weight.size(1), weight.size(2), weight.size(0)
     if not (
         n_ll in (2048, 3072, 4096, 4608, 5120, 6144, 7168)
-        and k_ll in (1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168)
+        and k_ll in (1024, 1536, 2048, 2304, 3072, 4096, 5120, 6144, 7168)
     ):
         raise ValueError(
             "m_grouped_fp8_gemm_nt_masked: (N,K,E) must match MOE_LL_*_SWITCH in "

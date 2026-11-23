@@ -1,0 +1,65 @@
+{
+    "configs": {
+        "1": {
+            "MODE": 1161,
+            "PERSISTENT_MULTIPLIER": 2
+        },
+        "2": {
+            "MODE": 1161,
+            "PERSISTENT_MULTIPLIER": 2
+        },
+        "4": {
+            "MODE": 1161,
+            "PERSISTENT_MULTIPLIER": 2
+        },
+        "6": {
+            "MODE": 1161,
+            "PERSISTENT_MULTIPLIER": 4
+        },
+        "8": {
+            "MODE": 1161,
+            "PERSISTENT_MULTIPLIER": 2
+        },
+        "14": {
+            "MODE": 1161,
+            "PERSISTENT_MULTIPLIER": 4
+        },
+        "16": {
+            "MODE": 1161,
+            "PERSISTENT_MULTIPLIER": 2
+        },
+        "32": {
+            "MODE": 1321,
+            "PERSISTENT_MULTIPLIER": 8
+        },
+        "56": {
+            "MODE": 1070
+        },
+        "64": {
+            "MODE": 1070
+        },
+        "84": {
+            "MODE": 1070
+        },
+        "112": {
+            "MODE": 1070
+        },
+        "128": {
+            "MODE": 1070
+        },
+        "256": {
+            "MODE": 1070
+        },
+        "512": {
+            "MODE": 1642,
+            "PERSISTENT_MULTIPLIER": 32
+        },
+        "1024": {
+            "MODE": 1642,
+            "PERSISTENT_MULTIPLIER": 16
+        },
+        "2048": {
+            "MODE": 2282
+        }
+    }
+}

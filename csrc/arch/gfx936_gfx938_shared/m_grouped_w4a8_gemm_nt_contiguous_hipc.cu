@@ -10,6 +10,9 @@
 #include "hip_common.h"
 #include "m_grouped_w4a8_gemm_nt_contiguous.h"
 #include "hipc_w4a8/w4a8_intrinsics.h"
+#include "m_grouped_w4a8_gemm_nt_contiguous_wasp/bm128_bn512_bk64.inc.cuh"
+
+namespace gfx936_gfx938_shared {
 #define DEBUG 0
 
 using half_t = __half;
@@ -869,7 +872,12 @@ torch::Tensor m_grouped_marlin_w4a8_gemm_nt_contiguous_hipc(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
-  TORCH_CHECK(mode == 1002, mode, " mode error.");
+  TORCH_CHECK(mode == 1002 || mode == 1006,
+              "unsupported contiguous W4A8 mode: ", mode);
+  if (mode == 1006) {
+    return m_grouped_w4a8_gemm_nt_contiguous_wasp_bm128_bn512_bk64::run(
+        input, b_qweight, output, a_scale, b_scale, m_indices);
+  }
   TORCH_CHECK(input.is_cuda() && b_qweight.is_cuda() && output.is_cuda() &&
                   a_scale.is_cuda() && b_scale.is_cuda() && m_indices.is_cuda(),
               "m_grouped_marlin_w4a8_gemm_nt_contiguous_hipc expects CUDA tensors");
@@ -915,3 +923,5 @@ torch::Tensor m_grouped_marlin_w4a8_gemm_nt_contiguous_hipc(
 }
 
 }
+
+}  // namespace gfx936_gfx938_shared

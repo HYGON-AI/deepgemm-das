@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// DeepGEMM contiguous FP8 GEMM (marlin tile) — TORCH_LIBRARY_FRAGMENT in
-// the ``deep_gemm`` namespace. Consumes ``m_indices`` directly (no Python-
-// side routing build).
+// DeepGEMM contiguous FP8 GEMM (marlin tile) in the ``deep_gemm`` namespace.
+// Consumes ``m_indices`` directly (no Python-side routing build).
 //
 // Exposes deep_gemm::m_grouped_fp8_gemm_nt_contiguous_marlin
 //   mode       : 0 -> auto by M, 1000/32 -> BM=32, 64 -> BM=64, 128 -> BM=128
@@ -117,10 +116,6 @@ void dispatch_launch_impl(int block_m, int n_loop_num, const LaunchParams& param
 void dispatch_launch(int block_m, int n_loop_num, const LaunchParams& params, hipStream_t stream) {
   dispatch_launch_impl<false>(block_m, n_loop_num, params, stream);
 }
-
-void dispatch_launch_tensor_wise(int block_m, int n_loop_num, const LaunchParams& params, hipStream_t stream) {
-  dispatch_launch_impl<true>(block_m, n_loop_num, params, stream);
-}
 } // namespace
 
 torch::Tensor m_grouped_fp8_gemm_nt_contiguous_marlin(
@@ -195,108 +190,4 @@ torch::Tensor m_grouped_fp8_gemm_nt_contiguous_marlin(
   return output;
 }
 
-
-torch::Tensor m_grouped_fp8_gemm_nt_contiguous_marlin_tensor_wise(
-    torch::Tensor input,
-    torch::Tensor b_qweight,
-    torch::Tensor output,
-    torch::Tensor a_scale,
-    torch::Tensor b_scale,
-    torch::Tensor m_indices,
-    int64_t mode,
-    int64_t n_loop_num) {
-  const c10::OptionalDeviceGuard device_guard(device_of(input));
-
-  TORCH_CHECK(input.is_cuda() && b_qweight.is_cuda(), "expected CUDA tensors");
-  TORCH_CHECK(input.element_size() == 1, "input must be 1-byte (fp8_e4m3 or int8)");
-  TORCH_CHECK(b_qweight.element_size() == 1, "weight must be 1-byte");
-  TORCH_CHECK(output.scalar_type() == at::kBFloat16, "output bf16");
-  TORCH_CHECK(
-      a_scale.scalar_type() == at::kFloat && b_scale.scalar_type() == at::kFloat,
-      "scales float32");
-  TORCH_CHECK(m_indices.scalar_type() == at::kInt, "m_indices int32");
-  TORCH_CHECK(m_indices.is_contiguous(), "m_indices must be contiguous");
-  TORCH_CHECK(m_indices.is_cuda(), "m_indices must be on CUDA");
-
-  const int size_m = static_cast<int>(input.size(0));
-  const int size_k = static_cast<int>(input.size(1));
-  const int size_n = static_cast<int>(output.size(-1));
-
-  const int block_m = pick_block_m(size_m, mode);
-  const int resolved_n_loop = pick_n_loop_num(size_n, n_loop_num);
-
-  TORCH_CHECK(size_m % block_m == 0,
-              "m_grouped_fp8_gemm_nt_contiguous_marlin_tensor_wise: size_m=", size_m,
-              " must be a multiple of BLOCK_M=", block_m);
-  TORCH_CHECK(static_cast<int>(m_indices.numel()) == size_m,
-              "m_indices length must equal size_m");
-  TORCH_CHECK(size_k % 64 == 0,
-              "m_grouped_fp8_gemm_nt_contiguous_marlin_tensor_wise: size_k=", size_k,
-              " must be a multiple of 64");
-
-  TORCH_CHECK(a_scale.dim() == 1 || a_scale.dim() == 2,
-              "a_scale must be 1-D [M] or 2-D [M, 1]");
-  TORCH_CHECK(b_scale.dim() == 1 || (b_scale.dim() == 2 && b_scale.size(1) == 1),
-              "tensor-wise b_scale must be 1-D [E] or 2-D [E, 1]");
-
-  const int stride_asm = static_cast<int>(a_scale.stride(0));
-  const int stride_ask = a_scale.dim() == 2 ? static_cast<int>(a_scale.stride(1)) : 0;
-
-  LaunchParams params{
-      as_char_ptr(input),
-      as_char_ptr(b_qweight),
-      output.data_ptr(),
-      a_scale.data_ptr<float>(),
-      b_scale.data_ptr<float>(),
-      m_indices.data_ptr<int32_t>(),
-      static_cast<uint32_t>(size_m),
-      static_cast<uint32_t>(size_n),
-      static_cast<uint32_t>(size_k),
-      static_cast<uint32_t>(stride_asm),
-      static_cast<uint32_t>(stride_ask),
-      static_cast<uint32_t>(size_n),
-      1,
-      0,
-  };
-
-  const hipStream_t stream =
-      c10::cuda::getCurrentCUDAStream(input.get_device()).stream();
-  dispatch_launch_tensor_wise(block_m, resolved_n_loop, params, stream);
-  return output;
-}
-
 } // namespace m_grouped_fp8_contig
-
-TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
-  m.def(
-      "m_grouped_fp8_gemm_nt_contiguous_marlin("
-      "Tensor input, "
-      "Tensor b_qweight, "
-      "Tensor output, "
-      "Tensor a_scale, "
-      "Tensor b_scale, "
-      "Tensor m_indices, "
-      "int mode, "
-      "int n_loop_num"
-      ") -> Tensor");
-  m.impl(
-      "m_grouped_fp8_gemm_nt_contiguous_marlin",
-      torch::kCUDA,
-      &m_grouped_fp8_contig::m_grouped_fp8_gemm_nt_contiguous_marlin);
-
-  m.def(
-      "m_grouped_fp8_gemm_nt_contiguous_marlin_tensor_wise("
-      "Tensor input, "
-      "Tensor b_qweight, "
-      "Tensor output, "
-      "Tensor a_scale, "
-      "Tensor b_scale, "
-      "Tensor m_indices, "
-      "int mode, "
-      "int n_loop_num"
-      ") -> Tensor");
-  m.impl(
-      "m_grouped_fp8_gemm_nt_contiguous_marlin_tensor_wise",
-      torch::kCUDA,
-      &m_grouped_fp8_contig::m_grouped_fp8_gemm_nt_contiguous_marlin_tensor_wise);
-}

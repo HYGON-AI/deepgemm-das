@@ -12,6 +12,8 @@ except Exception:  # Triton is only required by optional reference kernels.
     triton = None
     tl = None
 
+from .configs.w8a8_masked import select_w8a8_masked_mode
+
 def load_deep_gemm_library():
     lib_path = os.environ.get("DEEP_GEMM_LIB_PATH")
 
@@ -57,12 +59,7 @@ def _get_default_masked_ll_cu() -> int:
         return cached
 
     physical_cu = torch.cuda.get_device_properties(device).multi_processor_count
-    if physical_cu == 64:
-        cu = 256
-    elif physical_cu == 72:
-        cu = 288
-    else:
-        cu = 128
+    cu = physical_cu * 4
 
     _MASKED_LL_DEFAULT_CU_BY_DEVICE[device] = cu
     return cu
@@ -70,42 +67,6 @@ def _get_default_masked_ll_cu() -> int:
 
 def _resolve_masked_ll_cu(cu: Optional[int]) -> int:
     return _get_default_masked_ll_cu() if cu is None else int(cu)
-
-
-
-def m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-    lhs: tuple[torch.Tensor, torch.Tensor],
-    rhs: tuple[torch.Tensor, torch.Tensor],
-    out: torch.Tensor,
-    masked_m: torch.Tensor,
-    expected_m: int,
-    experts: int,
-    *,
-    block_wise: bool = True,
-    cu: Optional[int] = None,
-    enable_overlap: bool = False,
-    signal: Optional[torch.Tensor] = None,
-) -> Tuple[int, int]:
-    cu = _resolve_masked_ll_cu(cu)
-    matrix_a, matrix_a_scale = lhs
-    matrix_b, matrix_b_scale = rhs
-    op.low_latency_grouped_gemm(
-        matrix_a,
-        matrix_b,
-        matrix_a_scale,
-        matrix_b_scale,
-        masked_m,
-        out,
-        expected_m,
-        experts,
-        cu,
-        block_wise,
-        enable_overlap,
-        signal,
-    )
-    block_m = 16
-    bn = 256
-    return block_m, bn
 
 
 def m_grouped_w8a8_gemm_nt_masked_ll(
@@ -128,57 +89,18 @@ def m_grouped_w8a8_gemm_nt_masked_ll(
     cu = _resolve_masked_ll_cu(cu)
 
     experts = int(a[0].shape[0])
-    if int(masked_m.numel()) != experts:
-        raise ValueError(
-            f"masked_m length {masked_m.numel()} != expert count from a[0] ({experts})"
-        )
-    if int(b[0].shape[0]) != experts:
-        raise ValueError(
-            f"b[0].shape[0] ({b[0].shape[0]}) != expert count ({experts})"
-        )
-
     matrix_a, a_scale = a
     matrix_b, b_scale = b
-    if not block_wise:
-        if a_scale.dim() == 3:
-            if a_scale.size(-1) != 1:
-                raise ValueError(
-                    "channel-wise a_scale must have shape [E,M] or [E,M,1], "
-                    f"got {tuple(a_scale.shape)}"
-                )
-            a_scale = a_scale.squeeze(-1)
-        if b_scale.dim() == 3:
-            if b_scale.size(-1) != 1:
-                raise ValueError(
-                    "channel-wise b_scale must have shape [E,N] or [E,N,1], "
-                    f"got {tuple(b_scale.shape)}"
-                )
-            b_scale = b_scale.squeeze(-1)
-    if not a_scale.is_contiguous():
-        raise ValueError("a_scale must be contiguous")
-    if not b_scale.is_contiguous():
-        raise ValueError("b_scale must be contiguous")
-    if masked_m.dtype != torch.int32:
-        raise ValueError(f"masked_m must be torch.int32, got {masked_m.dtype}")
     masked_m_i32 = masked_m
 
-    expected_m_per_group = int(expected_m_per_group)
-    if PRINT_SIZE_ENABLED:
-        print_low_latency_masked_size(
-            "low_latency_grouped_gemm",
-            matrix_a,
-            matrix_b,
-            a_scale,
-            b_scale,
-            masked_m_i32,
-            d,
-            expected_m_per_group,
-            experts,
-            cu=cu,
-            block_wise=block_wise,
-            over_lap=False,
-            signal=None,
+    if config is not None and 'MODE' in config:
+        mode = config['MODE']
+    else:
+        mode = select_w8a8_masked_mode(
+            expected_m_per_group, d.shape[2], a[0].shape[2], a[0].shape[0], "hipc"
         )
+
+    expected_m_per_group = int(expected_m_per_group)
 
     op.low_latency_grouped_gemm(
         matrix_a,
@@ -193,6 +115,7 @@ def m_grouped_w8a8_gemm_nt_masked_ll(
         block_wise,
         False,
         None,
+        mode,
     )
     return d
 
@@ -210,37 +133,19 @@ def m_grouped_fp8_gemm_nt_masked_ll(
     block_wise: bool = False,
     cu: Optional[int] = None,
 ) -> torch.Tensor:
-    
-    del config
-    if block_wise:
-        raise RuntimeError("m_grouped_fp8_gemm_nt_masked only supports channel-wise non-block-wise scales")
+
     cu = _resolve_masked_ll_cu(cu)
 
     matrix_a, a_scale = a
     matrix_b, b_scale = b
 
-    if a_scale.dim() == 3:
-        a_scale = a_scale.squeeze(-1)
-    if b_scale.dim() == 3:
-        b_scale = b_scale.squeeze(-1)
-
     experts = int(matrix_a.shape[0])
     expected_m_per_group = int(expected_m_per_group)
-    if PRINT_SIZE_ENABLED:
-        print_low_latency_masked_size(
-            "low_latency_grouped_gemm",
-            matrix_a,
-            matrix_b,
-            a_scale,
-            b_scale,
-            masked_m,
-            d,
-            expected_m_per_group,
-            experts,
-            cu=cu,
-            block_wise=False,
-            over_lap=enable_overlap,
-            signal=signal,
+    if config is not None and 'MODE' in config:
+        mode = config['MODE']
+    else:
+        mode = select_w8a8_masked_mode(
+            expected_m_per_group, d.shape[2], matrix_a.shape[2], matrix_a.shape[0], "hipc"
         )
 
     op.low_latency_grouped_gemm(
@@ -256,177 +161,9 @@ def m_grouped_fp8_gemm_nt_masked_ll(
         False,
         enable_overlap,
         signal,
+        mode,
     )
     return d
-
-
-
-def m_grouped_fp8_gemm_nt_masked(
-    a: tuple[torch.Tensor, torch.Tensor],
-    b: tuple[torch.Tensor, torch.Tensor],
-    d: torch.Tensor,
-    masked_m: torch.Tensor,
-    expected_m_per_group: int,
-    enable_overlap: bool = False,
-    signal: Optional[torch.Tensor] = None,
-    config: Optional[Dict[str, Any]] = None,
-    *,
-    block_wise: bool = False,
-    cu: Optional[int] = None,
-) -> torch.Tensor:
-    return m_grouped_fp8_gemm_nt_masked_ll(
-        a,
-        b,
-        d,
-        masked_m,
-        expected_m_per_group,
-        enable_overlap=enable_overlap,
-        signal=signal,
-        config=config,
-        block_wise=block_wise,
-        cu=cu,
-    )
-
-
-def m_grouped_fp8_gemm_nt_masked_ll_tensor_wise(
-    a: tuple[torch.Tensor, torch.Tensor],
-    b: tuple[torch.Tensor, torch.Tensor],
-    d: torch.Tensor,
-    masked_m: torch.Tensor,
-    expected_m_per_group: int,
-    enable_overlap: bool = False,
-    signal: Optional[torch.Tensor] = None,
-    config: Optional[Dict[str, Any]] = None,
-    *,
-    cu: Optional[int] = None,
-) -> torch.Tensor:
-    del config
-    cu = _resolve_masked_ll_cu(cu)
-
-    experts = int(a[0].shape[0])
-    if int(masked_m.numel()) != experts:
-        raise ValueError(
-            f"masked_m length {masked_m.numel()} != expert count from a[0] ({experts})"
-        )
-    if int(b[0].shape[0]) != experts:
-        raise ValueError(
-            f"b[0].shape[0] ({b[0].shape[0]}) != expert count ({experts})"
-        )
-
-    matrix_a, a_scale = a
-    matrix_b, b_scale = b
-
-    if a_scale.dim() == 3 and a_scale.size(-1) == 1:
-        a_scale = a_scale.squeeze(-1)
-    if b_scale.dim() == 2 and b_scale.size(1) == 1:
-        pass
-    elif b_scale.dim() == 1:
-        pass
-    else:
-        raise ValueError(
-            "tensor-wise B scale must have shape [E] or [E, 1], "
-            f"got {tuple(b_scale.shape)}"
-        )
-
-    if not a_scale.is_contiguous():
-        raise ValueError("a_scale must be contiguous")
-    if not b_scale.is_contiguous():
-        raise ValueError("b_scale must be contiguous")
-    if masked_m.dtype != torch.int32:
-        raise ValueError(f"masked_m must be torch.int32, got {masked_m.dtype}")
-    masked_m_i32 = masked_m
-
-    expected_m_per_group = int(expected_m_per_group)
-    if PRINT_SIZE_ENABLED:
-        print_low_latency_masked_size(
-            "low_latency_grouped_gemm_tensor_wise",
-            matrix_a,
-            matrix_b,
-            a_scale,
-            b_scale,
-            masked_m_i32,
-            d,
-            expected_m_per_group,
-            experts,
-            cu=cu,
-            block_wise="tensor_wise",
-            over_lap=enable_overlap,
-            signal=signal,
-        )
-
-    op.low_latency_grouped_gemm_tensor_wise(
-        matrix_a,
-        matrix_b,
-        a_scale,
-        b_scale,
-        masked_m_i32,
-        d,
-        expected_m_per_group,
-        experts,
-        cu,
-        enable_overlap,
-        signal,
-    )
-    return d
-
-
-def grouped_gemm_fp8_fp8_bf16_nt_masked_tensor_wise_entry(
-    matrix_a: torch.Tensor,
-    matrix_b: torch.Tensor,
-    matrix_a_scale: torch.Tensor,
-    matrix_b_scale: torch.Tensor,
-    actual_tokens: torch.Tensor,
-    matrix_c: torch.Tensor,
-    max_tokens: int,
-    experts: int,
-    cu: int = 128,
-    over_lap: bool = False,
-    signal: Optional[torch.Tensor] = None,
-):
-    assert matrix_a_scale.is_contiguous()
-    if PRINT_SIZE_ENABLED:
-        print_low_latency_masked_size(
-            "low_latency_grouped_gemm_tensor_wise",
-            matrix_a,
-            matrix_b,
-            matrix_a_scale,
-            matrix_b_scale,
-            actual_tokens,
-            matrix_c,
-            max_tokens,
-            experts,
-            cu=cu,
-            block_wise="tensor_wise",
-            over_lap=over_lap,
-            signal=signal,
-        )
-    # return torch.ops.deep_gemm.low_latency_grouped_gemm_tensor_wise(
-    #     matrix_a,
-    #     matrix_b,
-    #     matrix_a_scale,
-    #     matrix_b_scale,
-    #     actual_tokens,
-    #     matrix_c,
-    #     max_tokens,
-    #     experts,
-    #     cu,
-    #     over_lap,
-    #     signal,
-    # )
-    return op.low_latency_grouped_gemm_tensor_wise(
-        matrix_a,
-        matrix_b,
-        matrix_a_scale,
-        matrix_b_scale,
-        actual_tokens,
-        matrix_c,
-        max_tokens,
-        experts,
-        cu,
-        over_lap,
-        signal,
-    )
-
 
 def grouped_gemm_w4a16_nt_masked_entry(
     matrix_a: torch.Tensor,
@@ -465,7 +202,7 @@ def grouped_gemm_w4a16_nt_masked_entry(
             max_tokens,
             experts,
         )
-    return torch.ops.deep_gemm.low_latency_w4a16_gemm(
+    return op.low_latency_w4a16_gemm(
         matrix_a, matrix_b, matrix_b_scale, actual_tokens, matrix_c, max_tokens, experts
     )
 
@@ -513,7 +250,7 @@ def grouped_gemm_wfp4a16_nt_masked_entry(
             max_tokens,
             experts,
         )
-    return torch.ops.deep_gemm.low_latency_wfp4a16_gemm(
+    return op.low_latency_wfp4a16_gemm(
         matrix_a, matrix_b, matrix_b_scale, actual_tokens, matrix_c, max_tokens, experts
     )
 
@@ -819,7 +556,7 @@ def _validate_int8_weight_enk_for_w6(weight_enk: torch.Tensor) -> tuple[int, int
     return num_experts, n, k
 
 
-def pack_int8_weight_enk_to_w6_low_latency(weight_enk: torch.Tensor) -> torch.Tensor:
+def pack_int8_weight_w6_ll(weight_enk: torch.Tensor) -> torch.Tensor:
     return pack_int8_weight_enk_to_w6_low_latency_inplace(weight_enk)
 
 
@@ -862,21 +599,3 @@ def pack_int8_weight_enk_to_w6_low_latency_inplace(weight_enk: torch.Tensor) -> 
         _CUSTOMER_K_TILE,
     )
 
-
-
-def m_grouped_fp8_gemm_nt_masked_tensor_wise(
-    a: tuple[torch.Tensor, torch.Tensor],
-    b: tuple[torch.Tensor, torch.Tensor],
-    d: torch.Tensor,
-    masked_m: torch.Tensor,
-    expected_m_per_group: int,
-    enable_overlap: bool = False,
-    signal: Optional[torch.Tensor] = None,
-    config: Optional[Dict[str, Any]] = None,
-    *,
-    cu: Optional[int] = None,
-) -> torch.Tensor:
-    return m_grouped_fp8_gemm_nt_masked_ll_tensor_wise(
-        a, b, d, masked_m, expected_m_per_group,
-        enable_overlap=enable_overlap, signal=signal, config=config, cu=cu
-    )

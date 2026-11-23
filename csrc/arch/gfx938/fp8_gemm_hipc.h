@@ -25,6 +25,8 @@
 #include <optional>
 #include <string>
 
+namespace gfx938 {
+
 // Raw-pointer params used by the underlying kernel. Not part of the public
 // call; kept here so profiling/debug harnesses (and versions.cpp) can build.
 struct DeepGemm_params {
@@ -76,3 +78,22 @@ void run_fp8_gemm_hipc(
                     const torch::Tensor& alpha,
                     const torch::Tensor& beta,
                     const std::optional<torch::Tensor>& bias);
+
+namespace deepgemm {
+void fp8_gemm_hipc(
+                    torch::Tensor mat_a,
+                    torch::Tensor mat_b,
+                    torch::Tensor scale_a,
+                    torch::Tensor scale_b,
+                    torch::Tensor output,
+                    const int64_t m,
+                    const int64_t n,
+                    const int64_t k,
+                    const int64_t batch,
+                    const std::string& transpose_flag,
+                    const torch::Tensor& alpha,
+                    const torch::Tensor& beta,
+                    const std::optional<torch::Tensor>& bias);
+}  // namespace deepgemm
+
+}  // namespace gfx938

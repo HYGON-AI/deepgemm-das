@@ -54,6 +54,7 @@ def run_case_impl(
     verify: bool = True,
     warmup: int = 20,
     iters: int = 100,
+    enable_overlap: bool = False,
 ) -> dict:
     torch.manual_seed(1)
     device = "cuda"
@@ -84,14 +85,45 @@ def run_case_impl(
     out = torch.empty((e, m, n), device=device, dtype=dtype)
     masked_m = masked_m.to(device=device, dtype=torch.int32).contiguous()
 
-    m_grouped_w4a8_gemm_nt_masked_hipc(
+    # overlap signal: E * ceil_div(M / 64)，int32
+    signal = None
+    if enable_overlap:
+        signal = torch.zeros(e * ((m + 63) // 64), device=device, dtype=torch.int32)
+
+    tile_shape = m_grouped_w4a8_gemm_nt_masked_hipc(
         (q_a, a_scale),
         (packed_w, kernel_w_scale),
         out,
         masked_m,
         expected_m_per_group,
+        enable_overlap=enable_overlap,
+        signal=signal,
     )
     torch.cuda.synchronize()
+
+    if enable_overlap and verify:
+        # 语义验证：signal[e * ceil(M/block_m) + m] 在专家 e 的第 m 个 block_m
+        # 全部 block_n 列块写回完成后应恰好等于 ceil_div(N, block_n)；
+        # masked_m 为 0 或超出有效 m tile 的槽位保持 0。
+        block_m, n_chunks = int(tile_shape[0]), int(tile_shape[1])
+        expected_counts = torch.zeros_like(signal)
+        tiles_per_expert = (m + block_m - 1) // block_m
+        for expert_idx in range(e):
+            cur_valid_m = int(masked_m[expert_idx].item())
+            active_tiles = (cur_valid_m + block_m - 1) // block_m
+            base = expert_idx * tiles_per_expert
+            expected_counts[base:base + active_tiles] = n_chunks
+        if not torch.equal(signal, expected_counts):
+            bad_slots = (signal != expected_counts).nonzero().flatten().tolist()
+            raise AssertionError(
+                "deepgemm masked w4a8 hipc overlap signal check failed: "
+                f"block_m={block_m}, n_chunks={n_chunks}, "
+                f"mismatched slots (first 16): {bad_slots[:16]}"
+            )
+        print(
+            "success deepgemm_masked_w4a8_hipc overlap signal 检查合格, "
+            f"block_m: {block_m}, ceil_div(N, block_n): {n_chunks}"
+        )
 
     max_abs = float("nan")
     if verify:
@@ -207,7 +239,7 @@ def run_case_impl(
     }
 
 
-def run_cases(verify: bool = True, warmup: int = 20, iters: int = 100) -> None:
+def run_cases(verify: bool = True, warmup: int = 20, iters: int = 100, enable_overlap: bool = False) -> None:
     seed = 0
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -243,7 +275,7 @@ def run_cases(verify: bool = True, warmup: int = 20, iters: int = 100) -> None:
             total_cases += 1
             n = n_list[i]
             k = k_list[i]
-            print(f"expected_m_per_group:{expected_m_per_group} n:{n} k:{k} ")
+            print(f"expected_m_per_group:{expected_m_per_group} n:{n} k:{k} overlap:{enable_overlap} ")
             masked_values = [
                 int(expected_m_per_group ) # * random.uniform(0.7, 1.3)
                 for _ in range(E)
@@ -262,6 +294,7 @@ def run_cases(verify: bool = True, warmup: int = 20, iters: int = 100) -> None:
                     verify=verify,
                     warmup=warmup,
                     iters=iters,
+                    enable_overlap=enable_overlap,
                 )
             except AssertionError:
                 if verify:
@@ -352,9 +385,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--no-verify", action="store_true")
+    parser.add_argument("--overlap", action="store_true",
+                        help="enable overlap signal mode and verify signal counts")
     args = parser.parse_args()
 
-    run_cases(verify=not args.no_verify, warmup=args.warmup, iters=args.iters)
+    run_cases(verify=not args.no_verify, warmup=args.warmup, iters=args.iters,
+              enable_overlap=args.overlap)
 
 
 if __name__ == "__main__":

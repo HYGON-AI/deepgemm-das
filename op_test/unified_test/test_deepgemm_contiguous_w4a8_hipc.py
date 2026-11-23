@@ -94,9 +94,11 @@ def run_case(name, experts, size_n, size_k, total_m, seed):
     framework_packed_w = pack_w4a8_weight_k_contiguous(weight_u4)
     packed_weight = pack_w4a8_moe_hipc_weight(framework_packed_w)
 
+    # kernel 解包后权重带 ×16 隐式缩放（高 nibble 直接送 int8 mfma），host 侧需除回 16
+    kernel_w_scale = w_scale / 16.0
     m_grouped_w4a8_gemm_nt_contiguous_hipc(
         (q_a, a_scale),
-        (packed_weight, w_scale),
+        (packed_weight, kernel_w_scale),
         output,
         m_indices,
     )
@@ -115,7 +117,7 @@ def run_case(name, experts, size_n, size_k, total_m, seed):
     best_us, median_us = _bench(
         lambda: m_grouped_w4a8_gemm_nt_contiguous_hipc(
             (q_a, a_scale),
-            (packed_weight, w_scale),
+            (packed_weight, kernel_w_scale),
             output,
             m_indices,
         )
