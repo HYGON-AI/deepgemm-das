@@ -249,25 +249,40 @@ def get_w8a16_linear_config(size_m: int, size_n: int, size_k: int) -> Dict[str, 
     elif size_n == 12288 and size_k == 2560 and size_m <= 16:
             config.update(
                 {
-                    "NUM_K_WARPS": 1,
+                    "NUM_K_WARPS": 2,
                     "N_PER_WARP": 32,
                     "K_PER_WARP": 256,
                     "NUM_N_WARPS": 2,
                     "SPLITK": 1,
                     "BLOCK_M": 16,
                     "KERNEL_TYPE": 0,
+                    "WEIGHT_LAYOUT": 1,
                 }
             )
     elif size_n == 12288 and size_k == 2560 and size_m <= 32:
         config.update(
             {
-                "NUM_K_WARPS": 4,
+                "NUM_K_WARPS": 2,
                 "N_PER_WARP": 32,
-                "K_PER_WARP": 64,
+                "K_PER_WARP": 128,
                 "NUM_N_WARPS": 2,
                 "SPLITK": 1,
                 "BLOCK_M": 32,
                 "KERNEL_TYPE": 1,
+                "WEIGHT_LAYOUT": 1,
+            }
+        )
+    elif size_n == 2560 and size_k == 4096 and size_m <= 16:
+        config.update(
+            {
+                "NUM_K_WARPS": 4,
+                "N_PER_WARP": 32,
+                "K_PER_WARP": 256,
+                "NUM_N_WARPS": 2,
+                "SPLITK": 1,
+                "BLOCK_M": 16,
+                "KERNEL_TYPE": 1,
+                "WEIGHT_LAYOUT": 1,
             }
         )
     elif size_n == 2560 and size_k == 4096 and size_m <= 32:
@@ -275,47 +290,38 @@ def get_w8a16_linear_config(size_m: int, size_n: int, size_k: int) -> Dict[str, 
             {
                 "NUM_K_WARPS": 4,
                 "N_PER_WARP": 32,
-                "K_PER_WARP": 64,
+                "K_PER_WARP": 256,
                 "NUM_N_WARPS": 2,
                 "SPLITK": 1,
-                "BLOCK_M": 16,
-                "KERNEL_TYPE": 0,
+                "BLOCK_M": 32,
+                "KERNEL_TYPE": 1,
+                "WEIGHT_LAYOUT": 1,
             }
         )
     elif size_n == 18432 and size_k == 2560 and size_m <= 16:
         config.update(
             {
                 "NUM_K_WARPS": 2,
-                "N_PER_WARP": 64,
+                "N_PER_WARP": 32,
                 "K_PER_WARP": 256,
-                "NUM_N_WARPS": 2,
+                "NUM_N_WARPS": 4,
                 "SPLITK": 1,
                 "BLOCK_M": 16,
                 "KERNEL_TYPE": 0,
+                "WEIGHT_LAYOUT": 1,
             }
         )
     elif size_n == 18432 and size_k == 2560 and size_m <= 32:
         config.update(
             {
                 "NUM_K_WARPS": 2,
-                "N_PER_WARP": 64,
-                "K_PER_WARP": 256,
-                "NUM_N_WARPS": 2,
+                "N_PER_WARP": 32,
+                "K_PER_WARP": 128,
+                "NUM_N_WARPS": 4,
                 "SPLITK": 1,
                 "BLOCK_M": 32,
                 "KERNEL_TYPE": 1,
-            }
-        )
-    elif size_n == 2560 and size_k == 9216 and size_m <= 7:
-        config.update(
-            {
-                "NUM_K_WARPS": 2,
-                "N_PER_WARP": 32,
-                "K_PER_WARP": 256,
-                "NUM_N_WARPS": 2,
-                "SPLITK": 4,
-                "BLOCK_M": 16,
-                "KERNEL_TYPE": 0,
+                "WEIGHT_LAYOUT": 1,
             }
         )
     elif size_n == 2560 and size_k == 9216 and size_m <= 16:
@@ -328,6 +334,7 @@ def get_w8a16_linear_config(size_m: int, size_n: int, size_k: int) -> Dict[str, 
                 "SPLITK": 8,
                 "BLOCK_M": 16,
                 "KERNEL_TYPE": 0,
+                "WEIGHT_LAYOUT": 1,
             }
         )
     elif size_n == 2560 and size_k == 9216 and size_m <= 32:
@@ -335,14 +342,15 @@ def get_w8a16_linear_config(size_m: int, size_n: int, size_k: int) -> Dict[str, 
             {
                 "NUM_K_WARPS": 4,
                 "N_PER_WARP": 32,
-                "K_PER_WARP": 64,
+                "K_PER_WARP": 256,
                 "NUM_N_WARPS": 2,
                 "SPLITK": 1,
-                "BLOCK_M": 16,
-                "KERNEL_TYPE": 0,
+                "BLOCK_M": 32,
+                "KERNEL_TYPE": 1,
+                "WEIGHT_LAYOUT": 1,
             }
         )
-    elif size_n == 10240 and size_k == 2560 and size_m <= 9:
+    elif size_n == 10240 and size_k == 2560 and size_m <= 16:
         config.update(
             {
                 "NUM_K_WARPS": 2,
@@ -352,30 +360,20 @@ def get_w8a16_linear_config(size_m: int, size_n: int, size_k: int) -> Dict[str, 
                 "SPLITK": 1,
                 "BLOCK_M": 16,
                 "KERNEL_TYPE": 0,
-            }
-        )
-    elif size_n == 10240 and size_k == 2560 and size_m <= 16:
-        config.update(
-            {
-                "NUM_K_WARPS": 2,
-                "N_PER_WARP": 32,
-                "K_PER_WARP": 64,
-                "NUM_N_WARPS": 2,
-                "SPLITK": 1,
-                "BLOCK_M": 16,
-                "KERNEL_TYPE": 0,
+                "WEIGHT_LAYOUT": 1,
             }
         )
     elif size_n == 10240 and size_k == 2560 and size_m <= 32:
         config.update(
             {
-                "NUM_K_WARPS": 4,
+                "NUM_K_WARPS": 2,
                 "N_PER_WARP": 32,
-                "K_PER_WARP": 128,
+                "K_PER_WARP": 256,
                 "NUM_N_WARPS": 2,
                 "SPLITK": 1,
                 "BLOCK_M": 32,
                 "KERNEL_TYPE": 1,
+                "WEIGHT_LAYOUT": 1,
             }
         )
     elif size_n == 9216 and size_k == 2048 and 2 <= size_m <= 8:
@@ -711,8 +709,6 @@ def w8a16_linear(
         config = _clamp_w8a16_splitk(dict(config), size_k)
     kernel_type = int(config.get("KERNEL_TYPE", 0))
     weight_layout = _cfg(config, "WEIGHT_LAYOUT")
-    if kernel_type == 0 and weight_layout != 0:
-        raise ValueError("decode KERNEL_TYPE=0 uses raw/non-shuffled W8A16 weights; set WEIGHT_LAYOUT=0")
     if kernel_type == 0:
         config = {**config, "BLOCK_M": 16}
     elif kernel_type == 1 and int(config.get("BLOCK_M", 0)) <= 0:

@@ -445,7 +445,7 @@ def install_op_size_printer(op_module: Any) -> None:
         "fp8_gemm": _format_fp8_gemm,
         "w8a16_linear": _format_w8a16_linear,
         "w8a16_linear_bias": _format_w8a16_linear_bias,
-        "tf32_hc_pernorm_gemm": _format_tf32,
+        "tf32_hc_prenorm_gemm": _format_tf32,
         "einsum": _format_einsum,
         "fp8_einsum": _format_fp8_einsum,
     }

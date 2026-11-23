@@ -15,6 +15,14 @@ static inline int smem_bytes(int num_k_warps, int n_per_warp, int num_n_warps, i
 }
 
 template <typename Element>
+static inline int bm16_smem_bytes(int num_k_warps, int n_per_warp, int num_n_warps,
+                                  int M_block, int k_per_warp) {
+    const int a_lds_bytes = 16 * k_per_warp * num_k_warps * (int)sizeof(Element);
+    const int out_bytes   = smem_bytes(num_k_warps, n_per_warp, num_n_warps, M_block);
+    return a_lds_bytes > out_bytes ? a_lds_bytes : out_bytes;
+}
+
+template <typename Element>
 static inline int bm32_smem_bytes(int num_k_warps, int n_per_warp, int num_n_warps,
                                   int M_block, int k_per_warp) {
     const int a_lds_bytes = 32 * k_per_warp * num_k_warps * (int)sizeof(Element);
@@ -76,27 +84,53 @@ gemm_w8a16_int8_kernel(
     #pragma unroll
     for (int i = 0; i < NLoop; i++) d_vec[i] = {0.f, 0.f, 0.f, 0.f};
 
+    extern __shared__ __align__(16) char bm16_smem[];
+    constexpr int num_load = 16 * KPerWarp / 64 / 8;  // 一个wave通过dowrdx4需要读取的次数
+    auto a_addr = prepare_for_buffer_load<Element>(a);
+    B_VEC tb[NLoop];
     for (int i = warp_idx * KPerWarp; i < K; i += KPerWarp * kNWarps) {
-        const int k_idx = i + col_id * k_fp16_per_thread;
-
-        if (row_valid)
-            a_vec = *(A_VEC*)(a + row_id * K + k_idx);
-
+        int k_cur = i + col_id * k_fp16_per_thread;
+        Element* a_lds = reinterpret_cast<Element*>(bm16_smem);
+        int row_num = 16 / num_load;
+        int num_thread_per_row = 64 / row_num;
+        const int rid = lane / num_thread_per_row;
+        const int cid = lane % num_thread_per_row;
+        if (warp_n_idx == 0) {
+            #pragma unroll
+            for(int j = 0; j < num_load; j++) {  // buffer_load A first16 row
+                int lds_offset = warp_idx * 16 * KPerWarp + j * row_num * KPerWarp;
+                // int v_offset = (j * row_num + rid) * K + i + cid * 8;
+                int v_offset = (j * row_num + rid) * K + i + (cid ^ ((j * row_num + rid) & (num_thread_per_row - 1))) * 8;
+                if(j * row_num + rid < M)
+                    inline_buffer_load_dwordx4_lds<Element, 1>(a_lds, a_addr, lds_offset, 0, v_offset);
+            }
+        }
+        wait_buffer_data_arrived<true>(0);
         #pragma unroll
         for (int nn = 0; nn < NLoop; nn++) {
             const int n_idx = NSizePerWarp * nn + row_id;
-            auto tb = load_w8a16_weight_vec<B_VEC, MARLIN_LAYOUT>(b, N, K, block_n + n_idx, k_idx);
-
+            tb[nn] = load_w8a16_weight_vec<B_VEC, MARLIN_LAYOUT>(b, N, K, block_n + n_idx, k_cur);
+        }
+        if(row_valid) {
+            #pragma unroll
+            for(int j = 0; j < num_load; j++) {  // 每个wave都从lds读A_first16
+                // int lds_offset = warp_idx * 16 * KPerWarp + row_id * KPerWarp + col_id * k_fp16_per_thread + j * 8;
+                int lds_offset = warp_idx * 16 * KPerWarp + row_id * KPerWarp + ((col_id * num_load + j) ^ (row_id & (num_thread_per_row - 1))) * 8;
+                inlineasm_ds_read_b128(reinterpret_cast<size_t>(a_lds + lds_offset), reinterpret_cast<w16_vec8_t<Element>*>(&a_vec)[j]);
+            }
+        }
+        wait_lds_data_arrived<true>(0);
+        #pragma unroll
+        for (int nn = 0; nn < NLoop; nn++) {
             #pragma unroll
             for (int ii = 0; ii < tc_number / 2; ii++) {
                 w16_vec4_t<Element> bv0;
                 w16_vec4_t<Element> bv1;
-                dequant_w8a16_to_reg<Element>(static_cast<uint32_t>(tb[ii * 2]),
-                                              static_cast<uint32_t>(tb[ii * 2 + 1]),
-                                              bv0,
-                                              bv1);
-                builtin_amdgcn_mmac_w16<Element>(reinterpret_cast<w16_vec4_t<Element>*>(&a_vec)[ii * 2    ], bv0, d_vec[nn]);
-                builtin_amdgcn_mmac_w16<Element>(reinterpret_cast<w16_vec4_t<Element>*>(&a_vec)[ii * 2 + 1], bv1, d_vec[nn]);
+                dequant_w8a16_to_reg<Element>(static_cast<uint32_t>(tb[nn][ii * 2]),
+                                                static_cast<uint32_t>(tb[nn][ii * 2 + 1]),
+                                                bv0, bv1);
+                    builtin_amdgcn_mmac_w16<Element>(reinterpret_cast<w16_vec4_t<Element>*>(&a_vec)[ii * 2    ], bv0, d_vec[nn]);
+                    builtin_amdgcn_mmac_w16<Element>(reinterpret_cast<w16_vec4_t<Element>*>(&a_vec)[ii * 2 + 1], bv1, d_vec[nn]);
             }
         }
     }
@@ -244,7 +278,7 @@ gemm_w8a16_int8_bm32_kernel(
     const int N_len = N - NPerWarp * bwid;
     const bool n_active = (N_len > 0);
     const int block_n = NPerWarp * bwid;
-    const bool full_n_m17_32_target = (!MARLIN_LAYOUT && total_M <= BLOCK_M && M > 16
+    const bool full_n_m17_32_target = (total_M <= BLOCK_M && M > 16
                                        && N_len >= NPerWarp);
     const int m_tail = M - 16;
 
@@ -270,6 +304,7 @@ gemm_w8a16_int8_bm32_kernel(
     extern __shared__ __align__(16) char bm32_smem[];
     constexpr int num_load = 16 * KPerWarp / 64 / 8;  // 一个wave通过dowrdx4需要读取的次数
     auto a_addr = prepare_for_buffer_load<Element>(a);
+    B_VEC tb[NLoop];
     if (n_active) {
         for (int i = warp_idx * KPerWarp; i < K; i += KPerWarp * kNWarps) {
             int k_cur = i + col_id * k_fp16_per_thread;
@@ -284,31 +319,40 @@ gemm_w8a16_int8_bm32_kernel(
                     #pragma unroll
                     for(int j = 0; j < num_load; j++) {  // buffer_load A first16 row
                         int lds_offset = warp_idx * 16 * KPerWarp + j * row_num * KPerWarp;
-                        int v_offset = (j * row_num + rid) * K + i + cid * 8;
+                        // int v_offset = (j * row_num + rid) * K + i + cid * 8;
+                        int v_offset = (j * row_num + rid) * K + i + (cid ^ ((j * row_num + rid) & (num_thread_per_row - 1))) * 8;
                         inline_buffer_load_dwordx4_lds<Element, 1>(a_lds, a_addr, lds_offset, 0, v_offset);
                     }
                     #pragma unroll
                     for(int j = 0; j < num_load; j++) {  // buffer_load A last16 row
                         int lds_offset = warp_idx * 16 * KPerWarp + j * row_num * KPerWarp;
-                        int v_offset = (16 + j * row_num + rid) * K + i + cid * 8;
+                        // int v_offset = (16 + j * row_num + rid) * K + i + cid * 8;
+                        int v_offset = (16 + j * row_num + rid) * K + i + (cid ^ ((j * row_num + rid) & (num_thread_per_row - 1))) * 8;
                         if(16 + j * row_num + rid < M)
                             inline_buffer_load_dwordx4_lds<Element, 1>(a_lds + a_lds_half_size, a_addr, lds_offset, 0, v_offset);
                     }
                 }
                 wait_buffer_data_arrived<true>(0);
                 #pragma unroll
+                for (int nn = 0; nn < NLoop; nn++) {
+                    const int n_idx = NSizePerWarp * nn + row_id;
+                    tb[nn] = load_w8a16_weight_vec<B_VEC, MARLIN_LAYOUT>(b, N, K, block_n + n_idx, k_cur);
+                }
+                #pragma unroll
                 for(int j = 0; j < num_load; j++) {  // 每个wave都从lds读A_first16
-                    int lds_offset = warp_idx * 16 * KPerWarp + row_id * KPerWarp + col_id * k_fp16_per_thread + j * 8;
+                    // int lds_offset = warp_idx * 16 * KPerWarp + row_id * KPerWarp + col_id * k_fp16_per_thread + j * 8;
+                    int lds_offset = warp_idx * 16 * KPerWarp + row_id * KPerWarp + ((col_id * num_load + j) ^ (row_id & (num_thread_per_row - 1))) * 8;
                     inlineasm_ds_read_b128(reinterpret_cast<size_t>(a_lds + lds_offset), reinterpret_cast<w16_vec8_t<Element>*>(&a_vec_m[0])[j]);
                 }
                 if(row_id < m_tail) {
                     #pragma unroll
                     for(int j = 0; j < num_load; j++) {  // 每个wave都从lds读A_last16
-                        int lds_offset = a_lds_half_size + warp_idx * 16 * KPerWarp + row_id * KPerWarp + col_id * k_fp16_per_thread + j * 8;
+                        // int lds_offset = a_lds_half_size + warp_idx * 16 * KPerWarp + row_id * KPerWarp + col_id * k_fp16_per_thread + j * 8;
+                        int lds_offset = a_lds_half_size + warp_idx * 16 * KPerWarp + row_id * KPerWarp + ((col_id * num_load + j) ^ (row_id & (num_thread_per_row - 1))) * 8;
                         inlineasm_ds_read_b128(reinterpret_cast<size_t>(a_lds + lds_offset), reinterpret_cast<w16_vec8_t<Element>*>(&a_vec_m[1])[j]);
                     }
                 }
-                wait_lds_data_arrived<false>(0);
+                wait_lds_data_arrived<true>(0);
             } else {
                 #pragma unroll
                 for (int mm = 0; mm < MLoop; mm++) {
@@ -319,18 +363,23 @@ gemm_w8a16_int8_bm32_kernel(
                         a_vec_m[mm] = {};
                     }
                 }
+                #pragma unroll
+                for (int nn = 0; nn < NLoop; nn++) {
+                    const int n_idx = NSizePerWarp * nn + row_id;
+                    tb[nn] = load_w8a16_weight_vec<B_VEC, MARLIN_LAYOUT>(b, N, K, block_n + n_idx, k_cur);
+                }
             }
             #pragma unroll
             for (int nn = 0; nn < NLoop; nn++) {
-                const int n_idx = NSizePerWarp * nn + row_id;
-                auto tb = load_w8a16_weight_vec<B_VEC, MARLIN_LAYOUT>(b, N, K, block_n + n_idx, k_cur);
+                // const int n_idx = NSizePerWarp * nn + row_id;
+                // auto tb = load_w8a16_weight_vec<B_VEC, MARLIN_LAYOUT>(b, N, K, block_n + n_idx, k_cur);
 
                 #pragma unroll
                 for (int ii = 0; ii < tc_number / 2; ii++) {
                     w16_vec4_t<Element> bv0;
                     w16_vec4_t<Element> bv1;
-                    dequant_w8a16_to_reg<Element>(static_cast<uint32_t>(tb[ii * 2]),
-                                                  static_cast<uint32_t>(tb[ii * 2 + 1]),
+                    dequant_w8a16_to_reg<Element>(static_cast<uint32_t>(tb[nn][ii * 2]),
+                                                  static_cast<uint32_t>(tb[nn][ii * 2 + 1]),
                                                   bv0, bv1);
                     #pragma unroll
                     for (int mm = 0; mm < MLoop; mm++) {

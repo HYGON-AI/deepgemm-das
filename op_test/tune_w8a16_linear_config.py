@@ -146,11 +146,21 @@ def parse_config_json(values: List[str], k: int) -> List[Config]:
     return configs
 
 
-def candidate_configs(n: int, k: int, preset: str, allow_1024_threads: bool) -> List[Config]:
+def marlin_supported(n: int, k: int) -> bool:
+    """w8a16_marlin_weight() shuffles in 16-row / 128-byte tiles."""
+    return n % 16 == 0 and k % 128 == 0
+
+
+def candidate_configs(
+    n: int, k: int, preset: str, allow_1024_threads: bool, marlin: bool = True
+) -> List[Config]:
     if k % 16 != 0:
         return []
 
     max_wave_product = 16 if allow_1024_threads else 8
+    # KERNEL_TYPE=0 is raw-only (the decode kernel has no marlin indexing), so the
+    # WEIGHT_LAYOUT sweep only applies to the prefill grid below.
+    layouts = (0, 1) if marlin and marlin_supported(n, k) else (0,)
 
     if preset == "tiny":
         kt0_space = {
@@ -207,7 +217,8 @@ def candidate_configs(n: int, k: int, preset: str, allow_1024_threads: bool) -> 
                         continue
                     for sk in kt0_space["sk"]:
                         sk_eff = min(sk, max(1, k // kpw))
-                        rows.append(make_config(0, kw, npw, kpw, nw, sk_eff, 16))
+                        for wl in layouts:
+                            rows.append(make_config(0, kw, npw, kpw, nw, sk_eff, 16, wl))
 
     for kw in kt1_space["kw"]:
         for npw in kt1_space["npw"]:
@@ -216,7 +227,8 @@ def candidate_configs(n: int, k: int, preset: str, allow_1024_threads: bool) -> 
                     if kw * nw > max_wave_product:
                         continue
                     for bm in kt1_space["bm"]:
-                        rows.append(make_config(1, kw, npw, kpw, nw, 1, bm))
+                        for wl in layouts:
+                            rows.append(make_config(1, kw, npw, kpw, nw, 1, bm, wl))
 
     deduped: List[Config] = []
     seen = set()
@@ -401,6 +413,11 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--preset", choices=("tiny", "quick", "full"), default="quick")
     parser.add_argument("--allow-1024-threads", action="store_true", help="allow NUM_K_WARPS*NUM_N_WARPS=16 candidates")
+    parser.add_argument(
+        "--no-marlin",
+        action="store_true",
+        help="skip WEIGHT_LAYOUT=1 candidates (roughly halves the KERNEL_TYPE=1 grid)",
+    )
     parser.add_argument("--config-json", action="append", default=[], help="extra config JSON object/list to try")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--rep", type=int, default=7)
@@ -433,7 +450,8 @@ def main() -> None:
     print(f"torch={torch.__version__} hip={torch.version.hip} gpu={torch.cuda.get_device_name(0)}")
     print(
         f"dtype={args.dtype} preset={args.preset} M={range_text(m_values)} "
-        f"cold_cache_flush={args.flush_mb}MB warmup={args.warmup} rep={args.rep} rounds={args.rounds}"
+        f"cold_cache_flush={args.flush_mb}MB warmup={args.warmup} rep={args.rep} rounds={args.rounds} "
+        f"marlin={'off' if args.no_marlin else 'on'}"
     )
     print(f"atol={args.atol} rtol={args.rtol}")
     print()
@@ -451,7 +469,23 @@ def main() -> None:
             raise ValueError(f"{shape_name}: N must be divisible by 4 for fused vector stores, got N={n}")
 
         x_full, weight, scale = make_inputs(shape_name, max(m_values), n, k, dtype)
-        base_candidates = candidate_configs(n, k, args.preset, args.allow_1024_threads)
+        # WEIGHT_LAYOUT=1 candidates must be fed a pre-shuffled weight; `ref` stays on
+        # the raw one, so a broken shuffle shows up as a correctness failure instead of
+        # a fast-but-wrong winner.
+        if args.no_marlin:
+            weight_marlin = None
+        elif marlin_supported(n, k):
+            weight_marlin = deepgemm.w8a16_marlin_weight(weight)
+        else:
+            weight_marlin = None
+            print(
+                f"# {shape_name} N={n} K={k}: WEIGHT_LAYOUT=1 skipped, "
+                f"needs N%16==0 and K%128==0",
+                flush=True,
+            )
+        base_candidates = candidate_configs(
+            n, k, args.preset, args.allow_1024_threads, not args.no_marlin
+        )
         extra_candidates = parse_config_json(args.config_json, k)
 
         for m in m_values:
@@ -473,6 +507,8 @@ def main() -> None:
             deduped: List[Tuple[str, Config]] = []
             seen = set()
             for cname, cfg in candidates:
+                if cfg["WEIGHT_LAYOUT"] == 1 and weight_marlin is None:
+                    continue
                 key = config_key(cfg)
                 if key in seen:
                     continue
@@ -480,7 +516,16 @@ def main() -> None:
                 deduped.append((cname, cfg))
 
             measured = [
-                measure_one(cname, cfg, x, weight, scale, ref, args, flusher)
+                measure_one(
+                    cname,
+                    cfg,
+                    x,
+                    weight_marlin if cfg["WEIGHT_LAYOUT"] == 1 else weight,
+                    scale,
+                    ref,
+                    args,
+                    flusher,
+                )
                 for cname, cfg in deduped
             ]
             valid = [row for row in measured if row["ok"]]
@@ -525,9 +570,16 @@ def main() -> None:
             print(flush=True)
 
     print("Suggested config ranges:")
-    for label, n, k, cfg in best_rows_by_range(all_results):
+    suggested = best_rows_by_range(all_results)
+    for label, n, k, cfg in suggested:
         print(f"  {label} N={n} K={k} -> {config_tag(cfg)}")
-        print("    " + json.dumps(cfg, ensure_ascii=False, sort_keys=True))
+        # print("    " + json.dumps(cfg, ensure_ascii=False, sort_keys=True))
+    if any(cfg["WEIGHT_LAYOUT"] == 1 for _, _, _, cfg in suggested):
+        print(
+            "\n  NOTE: WL=1 needs the weight pre-shuffled by deepgemm.w8a16_marlin_weight()."
+            "\n        w8a16_linear() hands the weight to the kernel untouched, so adopting such"
+            "\n        a config without shuffling at load time silently returns wrong results."
+        )
 
     if args.output_json:
         payload = {

@@ -2,7 +2,7 @@ import torch
 from functools import lru_cache
 from typing import Any, Optional
 
-from .m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+from .m_group_gemm import pack_int8_weight_w6_ll
 
 
 _CUSTOMER_N_TILE = 16
@@ -19,6 +19,8 @@ I8_LAYOUT_MODE_MASKED_LAYOUT = I8_LAYOUT_MODE_MASKED_LAYOUT_ASM
 # To default gfx936 shuffle_unique=1 to mode 2, change only this line.
 I8_LAYOUT_MODE_DEFAULT = I8_LAYOUT_MODE_W6_HIPC
 _I8_LAYOUT_MODES = (I8_LAYOUT_MODE_W6_HIPC, I8_LAYOUT_MODE_MASKED_LAYOUT_ASM)
+
+BF16_LAYOUT_MODE_HIPC = 1
 
 BF16_MASKED_BM64_BN256_BK128_AUTO_MODE = 2000
 BF16_MASKED_BM64_BN256_BK128_SMALL_M_MODE = 2001
@@ -92,31 +94,12 @@ def _pack_bf16_masked_bm64_bn256_bk128_weight(weight: torch.Tensor) -> torch.Ten
     return packed.view_as(weight)
 
 
-def _get_bf16_masked_bm64_bn256_bk128_config(
-    mode: int = BF16_MASKED_BM64_BN256_BK128_AUTO_MODE,
-    *,
-    packed_weight: bool = False,
-) -> dict[str, Any]:
-    mode = int(mode)
-    if mode not in BF16_MASKED_BM64_BN256_BK128_MODES:
-        raise ValueError(
-            "BF16 masked BM64/BN256/BK128 mode must be 2000 (auto), "
-            f"2001 (small_m), or 2002 (prefetch), got {mode}"
-        )
-    return {
-        "MODE": mode,
-        "WEIGHT_LAYOUT": BF16_MASKED_BM64_BN256_BK128_LAYOUT,
-        "PACKED_WEIGHT": bool(packed_weight),
-    }
-
-
 def _prepare_bf16_masked_bm64_bn256_bk128_weight(
     weight: torch.Tensor,
     mode: int = BF16_MASKED_BM64_BN256_BK128_AUTO_MODE,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     packed_weight = _pack_bf16_masked_bm64_bn256_bk128_weight(weight)
-    config = _get_bf16_masked_bm64_bn256_bk128_config(mode, packed_weight=True)
-    return packed_weight, config
+    return packed_weight
 
 
 def _resolve_shuffle_unique(shuffle_unique: int) -> int:
@@ -126,45 +109,103 @@ def _resolve_shuffle_unique(shuffle_unique: int) -> int:
     return value
 
 
-def _resolve_i8_layout_mode(mode: Any) -> int:
-    value = int(mode)
-    if value not in _I8_LAYOUT_MODES:
-        raise ValueError(
-            "INT8 layout mode must be 1 (W6 HIPC layout) or "
-            f"2 (masked-layout ASM), got {mode}"
+def _check_pair32_weight(weight: torch.Tensor) -> torch.Tensor:
+    if weight.dim() != 3:
+        raise ValueError(f"weight must be [E,N,K], got {tuple(weight.shape)}")
+    if weight.element_size() != 1:
+        raise ValueError(f"weight must have one-byte elements, got dtype={weight.dtype}")
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    _, n, k = weight.shape
+    if n % 256 != 0:
+        raise ValueError(f"N={n} must satisfy N%256==0")
+    if k % 64 != 0:
+        raise ValueError(f"K={k} must satisfy K%64==0")
+    return weight
+
+
+def pack_i8_weight_pair32(weight_enk: torch.Tensor) -> torch.Tensor:
+    weight = _check_pair32_weight(weight_enk)
+    experts, n, k = weight.shape
+    stride_n, stride_k = weight.stride()[1:]
+    packed = torch.empty(
+        (experts, k // 64, n // 32, 2, 4, 16, 16),
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    for expert in range(experts):
+        source_view = torch.as_strided(
+            weight[expert],
+            size=(n // 32, 2, 4, 4, k // 64, 4, 16),
+            stride=(
+                32 * stride_n,
+                stride_n,
+                8 * stride_n,
+                2 * stride_n,
+                64 * stride_k,
+                16 * stride_k,
+                stride_k,
+            ),
         )
-    return value
+        packed_view = source_view.permute(4, 0, 1, 5, 3, 2, 6)
+        packed[expert].copy_(packed_view.contiguous().view_as(packed[expert]))
+    return packed
+
+def pack_fp8_weight_pair32(weight_enk: torch.Tensor) -> torch.Tensor:
+    weight = _check_pair32_weight(weight_enk)
+    experts, n, k = weight.shape
+    stride_n, stride_k = weight.stride()[1:]
+    packed = torch.empty(
+        (experts, k // 64, n // 32, 2, 4, 16, 16),
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    for expert in range(experts):
+        source_view = torch.as_strided(
+            weight[expert],
+            size=(n // 32, 2, 4, 4, k // 64, 4, 16),
+            stride=(
+                32 * stride_n,
+                stride_n,
+                8 * stride_n,
+                2 * stride_n,
+                64 * stride_k,
+                16 * stride_k,
+                stride_k,
+            ),
+        )
+        packed_view = source_view.permute(4, 0, 1, 5, 3, 2, 6)
+        packed[expert].copy_(packed_view.contiguous().view_as(packed[expert]))
+    return packed
 
 
-def _resolve_i8_layout_mode_from_config(config: Optional[dict[str, Any]]) -> int:
-    if config is None or "MODE" not in config:
-        return I8_LAYOUT_MODE_DEFAULT
-    value = int(config["MODE"])
-    if value in _I8_LAYOUT_MODES:
-        return value
-    return I8_LAYOUT_MODE_DEFAULT
 
-
-def _strip_i8_layout_mode_from_config(config: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
-    if config is None or "MODE" not in config:
-        return config
-    value = int(config["MODE"])
-    if value not in _I8_LAYOUT_MODES:
-        return config
-    stripped = dict(config)
-    stripped.pop("MODE", None)
-    return stripped or None
-
-
-def _is_gfx936_contiguous_arch(arch: str) -> bool:
-    return arch in ("gfx936", "gfx92a", "gfx928")
-
+def pack_fp8_weight_pair32_v2(weight_enk: torch.Tensor) -> torch.Tensor:
+    """Pack [E, N, K] weights for the gfx938 FP8 pair32 v2 kernels."""
+    weight = _check_pair32_weight(weight_enk)
+    experts, n, k = weight.shape
+    stride_n, stride_k = weight.stride()[1:]
+    packed = torch.empty(
+        (experts, k // 64, n // 32, 2, 4, 16, 16),
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    for expert in range(experts):
+        source_view = torch.as_strided(
+            weight[expert],
+            size=(n // 32, 2, 4, 4, k // 64, 2, 4, 8),
+            stride=(32 * stride_n, stride_n, 8 * stride_n, 2 * stride_n,
+                    64 * stride_k, 32 * stride_k, 8 * stride_k, stride_k),
+        )
+        packed_view = source_view.permute(4, 0, 1, 6, 3, 2, 5, 7)
+        packed[expert].copy_(packed_view.contiguous().view_as(packed[expert]))
+    return packed
 
 def _is_fp8_low_latency_arch(arch: str) -> bool:
-    return arch == "gfx938"
+    return arch == "gfx938" or arch == "gfx92a"
 
 
-def pack_i8_contiguous_weight_gfx936_w6(weight_enk: torch.Tensor) -> torch.Tensor:
+def pack_i8_weight_gfx936_w6(weight_enk: torch.Tensor) -> torch.Tensor:
     if weight_enk.dim() != 3:
         raise ValueError(
             f"weight_enk must be [E,N,K], got dim {weight_enk.dim()} shape {tuple(weight_enk.shape)}"
@@ -272,12 +313,12 @@ def pack_i8_masked_weight_gfx936_asm(
     k_tile1: int = 4,
     n_tile: int = 16,
 ) -> torch.Tensor:
-    return pack_i8_masked_weight_gfx936_asm_inplace(
+    return pack_i8_weight_gfx936_asm(
         weight, k_tile=k_tile, k_tile1=k_tile1, n_tile=n_tile
     )
 
 
-def pack_i8_masked_weight_gfx936_asm_inplace(
+def pack_i8_weight_gfx936_asm(
     weight: torch.Tensor,
     k_tile: int = 16,
     k_tile1: int = 4,
@@ -462,52 +503,24 @@ def _pack_bf16_masked_asm_weight_2d(
 
 def pack_bf16_masked_weight(
     weight: torch.Tensor,
-    mode: int = BF16_MASKED_BM64_BN256_BK128_AUTO_MODE,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Prepare BF16 masked GEMM weight and matching config for the front-end."""
-    mode = int(mode)
-    if mode in BF16_MASKED_BM64_BN256_BK128_MODES:
-        return _prepare_bf16_masked_bm64_bn256_bk128_weight(weight, mode)
-    if mode in BF16_MASKED_ASM_MODES:
-        return weight.contiguous(), {
-            "MODE": mode,
-            "WEIGHT_LAYOUT": BF16_MASKED_ASM_LAYOUT,
-            "PACKED_WEIGHT": False,
-        }
-    raise ValueError(
-        "BF16 masked mode must be 1000/1001 for asm layout or "
-        f"2000/2001/2002 for BM64/BN256/BK128 layout, got {mode}"
-    )
+    return _prepare_bf16_masked_bm64_bn256_bk128_weight(weight)
 
     
 def marlin_i8_contiguous_weight(
     weight: torch.Tensor,
     *,
     shuffle_unique: int = 1,
-    mode: int = I8_LAYOUT_MODE_DEFAULT,
-    arch: Optional[str] = None,
-    low_memory: bool = True,
+    **kwargs,
 ) -> torch.Tensor:
-    arch = _resolve_arch(arch)
-    shuffle_unique = _resolve_shuffle_unique(shuffle_unique)
-    mode = _resolve_i8_layout_mode(mode)
-    if mode == I8_LAYOUT_MODE_MASKED_LAYOUT_ASM and shuffle_unique != 1:
-        raise ValueError("INT8 layout mode=2 is only valid with shuffle_unique=1")
-    if arch == "gfx938":
-        if mode != I8_LAYOUT_MODE_W6_HIPC:
-            raise RuntimeError("INT8 layout mode=2 is only implemented for gfx936")
-        return pack_int8_weight_enk_to_w6_low_latency(weight)
-    if _is_gfx936_contiguous_arch(arch):
-        if mode == I8_LAYOUT_MODE_MASKED_LAYOUT_ASM:
-            if arch != "gfx936":
-                raise RuntimeError("INT8 layout mode=2 is only implemented for gfx936")
-            return pack_i8_masked_weight_gfx936_asm_inplace(weight)
-        if shuffle_unique == 1:
-            return pack_i8_contiguous_weight_gfx936_w6(weight)
-        return pack_i8_contiguous_weight_gfx936_asm_inplace(weight)
+    arch = _get_current_gfx_arch()
+
+    return pack_i8_weight_pair32(weight)
+
     raise RuntimeError(
-        f"marlin_i8_contiguous_weight does not support GPU arch {arch}; "
-        "expected gfx936/gfx92a/gfx928 or gfx938"
+        f"marlin_i8_masked_weight does not support GPU arch {arch}; "
+        "expected gfx936/gfx92a or gfx938"
     )
 
 
@@ -515,30 +528,15 @@ def marlin_i8_masked_weight(
     weight: torch.Tensor,
     *,
     shuffle_unique: int = 1,
-    mode: int = I8_LAYOUT_MODE_DEFAULT,
-    arch: Optional[str] = None,
-    low_memory: bool = True,
+    **kwargs,
 ) -> torch.Tensor:
-    arch = _resolve_arch(arch)
-    shuffle_unique = _resolve_shuffle_unique(shuffle_unique)
-    mode = _resolve_i8_layout_mode(mode)
-    if mode == I8_LAYOUT_MODE_MASKED_LAYOUT_ASM and shuffle_unique != 1:
-        raise ValueError("INT8 layout mode=2 is only valid with shuffle_unique=1")
-    if arch == "gfx938":
-        if mode != I8_LAYOUT_MODE_W6_HIPC:
-            raise RuntimeError("INT8 layout mode=2 is only implemented for gfx936")
-        return pack_int8_weight_enk_to_w6_low_latency(weight)
-    if _is_gfx936_contiguous_arch(arch):
-        if mode == I8_LAYOUT_MODE_MASKED_LAYOUT_ASM:
-            if arch != "gfx936":
-                raise RuntimeError("INT8 layout mode=2 is only implemented for gfx936")
-            return pack_i8_masked_weight_gfx936_asm_inplace(weight)
-        if shuffle_unique == 1:
-            return pack_i8_contiguous_weight_gfx936_w6(weight)
-        return pack_i8_masked_weight_gfx936_asm_inplace(weight)
+    arch = _get_current_gfx_arch()
+
+    return pack_i8_weight_pair32(weight)
+
     raise RuntimeError(
         f"marlin_i8_masked_weight does not support GPU arch {arch}; "
-        "expected gfx936/gfx92a/gfx928 or gfx938"
+        "expected gfx936/gfx92a or gfx938"
     )
 
 
@@ -560,12 +558,9 @@ def marlin_fp8_masked_weight(
     *,
     arch: Optional[str] = None,
 ) -> torch.Tensor:
-    arch = _resolve_arch(arch)
-    if _is_fp8_low_latency_arch(arch):
-        return pack_int8_weight_enk_to_w6_low_latency(weight)
-    if arch == "gfx92a":
-        return pack_int8_weight_enk_to_w6_low_latency_gfx92a(weight)
-    raise RuntimeError(f"marlin_fp8_masked_weight does not support GPU arch {arch}; expected gfx938")
+    if _resolve_arch(arch) == "gfx938":
+        return pack_fp8_weight_pair32_v2(weight)
+    return pack_fp8_weight_pair32(weight)
 
 
 def marlin_fp8_contiguous_weight(
@@ -573,22 +568,13 @@ def marlin_fp8_contiguous_weight(
     *,
     arch: Optional[str] = None,
 ) -> torch.Tensor:
-    arch = _resolve_arch(arch)
-    if _is_fp8_low_latency_arch(arch):
-        return pack_int8_weight_enk_to_w6_low_latency(weight)
-    if arch == "gfx92a":
-        return pack_int8_weight_enk_to_w6_low_latency_gfx92a(weight)
-    raise RuntimeError(f"marlin_fp8_contiguous_weight does not support GPU arch {arch}; expected gfx92a/gfx938/gfx946")
+    if _resolve_arch(arch) == "gfx938":
+        return pack_fp8_weight_pair32_v2(weight)
+    return pack_fp8_weight_pair32(weight)
 
 
-pack_i8_contiguous_weight = marlin_i8_contiguous_weight
-pack_i8_masked_weight = marlin_i8_masked_weight
-pack_fp8_contiguous_weight = marlin_fp8_contiguous_weight
-pack_fp8_masked_weight = marlin_fp8_masked_weight
-
-
-pack_w8a8_gfx936_weight_to_w6 = pack_i8_contiguous_weight_gfx936_w6
-pack_int8_weight_enk_to_w6_gfx936_pack_permute = pack_i8_contiguous_weight_gfx936_w6
+pack_w8a8_gfx936_weight_to_w6 = pack_i8_weight_gfx936_w6
+pack_int8_weight_enk_to_w6_gfx936_pack_permute = pack_i8_weight_gfx936_w6
 
 
 def pack_w4a8_weight_k_contiguous(weight_u4: torch.Tensor) -> torch.Tensor:
@@ -767,3 +753,11 @@ def pack_w4a8_moe_hipc_weight(packed_k_contiguous: torch.Tensor) -> torch.Tensor
     is rewritten to the HIPC N32 layout consumed by the kernel.
     """
     return pack_w4a8_moe_hipc_weight_inplace(packed_k_contiguous)
+
+
+pack_i8_contiguous_weight = marlin_i8_contiguous_weight
+pack_i8_masked_weight = marlin_i8_masked_weight
+pack_fp8_contiguous_weight = marlin_fp8_contiguous_weight
+pack_fp8_masked_weight = marlin_fp8_masked_weight
+pack_w4a8_contiguous_weight = pack_w4a8_moe_hipc_weight
+pack_w4a8_masked_weight = pack_w4a8_moe_hipc_weight

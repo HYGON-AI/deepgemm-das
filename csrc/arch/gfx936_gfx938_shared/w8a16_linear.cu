@@ -7,6 +7,10 @@
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
 
+#include <hip/hip_bf16.h>
+#include <type_traits>
+
+namespace gfx936_gfx938_shared {
 #include "moe_marlin/w8a16_linear_kernels.h"
 
 #ifndef DEEPGEMM_KERNEL_LAUNCH_CHECK
@@ -161,7 +165,7 @@ static void launch_w8a16_linear(
                                 dim3 grid(ceil_div(M, 16),
                                           ceil_div(N, NPerWarp * NUM_N_WARPS));
                                 dim3 block(NUM_K_WARPS * 64, NUM_N_WARPS);
-                                int lds_size = smem_bytes(NUM_K_WARPS, NPerWarp, NUM_N_WARPS, MIN(16, M));
+                                int lds_size = bm16_smem_bytes<Element>(NUM_K_WARPS, NPerWarp, NUM_N_WARPS, MIN(16, M), KPerWarp);
                                 hipLaunchKernelGGL((gemm_w8a16_int8_kernel<Element, Scale, MARLIN_LAYOUT, NUM_K_WARPS, NPerWarp, KPerWarp, NUM_N_WARPS>),
                                                    dim3(grid), dim3(block), lds_size, stream,
                                                    out_ptr, a_ptr, b_ptr, s_ptr,
@@ -386,3 +390,5 @@ torch::Tensor w8a16_dequant_weight_bf16(
 }
 
 } // namespace deepgemm
+
+}  // namespace gfx936_gfx938_shared

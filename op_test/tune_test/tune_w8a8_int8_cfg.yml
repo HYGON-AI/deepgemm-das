@@ -1,0 +1,84 @@
+# w8a8_int8 masked tune 的运行参数(含 MODE 表 + 扫描 case 引用)
+# 由 tune_w8a8_int8.py --config 直接加载, 无中间 index 层
+# 本文件内的相对路径(cases / out / config_root)一律相对本 yml 所在目录解析
+
+# =======================================================
+# MODE 相关(原 w8a8_int8_shuffle_unique_modes.yml,已内联到此)
+# 注意: 当前 C++ 侧 mode 支持可能还不完善,这里先给占位,后续填真实候选
+#       未支持的 mode 在 run 时会抛异常, tune 脚本会记录为 inf 并跳过
+# =======================================================
+
+# 需要遍历的 MODE 列表(占位,可自行补齐)
+# gfx936专属: 1000 1001 10002
+modes:
+  - 1000
+  - 1001
+  - 1002
+
+# 需要走 persistent 分支的 MODE 集合(暂无,留空即可)
+persistent_modes: []
+
+# 各 MODE 对应的 PERSISTENT_MULTIPLIER 默认值(暂无)
+mode_default_mult: {}
+
+# =======================================================
+# 矩阵/形状扫描配置
+# =======================================================
+
+# 描述要扫描哪些 (E, N, K, expected_m) case 的 YAML 文件
+# (与 tune_w4a8 共用同一份 masked_cases.yml, 保证两边扫描点一致)
+cases: masked_cases.yml
+
+# =======================================================
+# 运行相关参数
+# =======================================================
+
+# 监控 / 计算所用的 HCU 编号
+gpu: 3
+
+# 每个 expert 分配的最大 M 维(激活行数上限,需 >= EXPECTED 里的最大值)
+m: 2048
+
+# 基准测试节奏
+warmup: 8
+iters: 40
+repeats: 3
+
+# 传给算子/权重打包函数: 0 = non shuffle unique, 1 = shuffle unique
+shuffle_unique: 0
+
+# 原始测量结果 CSV 输出路径(相对本 yml 目录 or 绝对路径)
+out: w8a8_int8_masked_sweep_stable.csv
+
+# 是否根据已存在的 CSV 断点续跑
+resume: false
+
+# 跑完 tuning 后是否顺便根据 CSV 产出 JSON 配置
+emit_config: true
+
+# 是否只根据现有 CSV 产出 JSON,不再跑 kernel
+emit_only: false
+
+# 是否只执行 emit_aggregate_configs 聚合逻辑
+#   - 读取 {config_root}/{arch}/w8a8_masked/{layout} 下已有的 *_E*_N*_K*.json,
+#     按众数汇总出 *_N*_K*.json 与 *_DEFAULT*.json, 不解析 CSV、不跑 kernel
+#   - 为 True 时优先级高于 emit_only
+aggregate_only: false
+
+# 架构号: 留空 / null 则自动识别(同 w8a8_masked.py 的 _current_gfx_arch)
+#   - 环境变量 DEEPGEMM_W8A8_INT8_MASKED_ARCH 优先
+#   - 也可显式指定: gfx936 / gfx938 / gfx92a
+arch: null
+
+# JSON 配置输出的布局子目录(与运行时 layout_dir 一致, 可选)
+#   - 留空: 直接输出到 {config_root}/{arch}/w8a8_masked/
+#   - 填写: 输出到 {config_root}/{arch}/w8a8_masked/{layout}/
+#   - shuffle_unique=0 (gfx936/gfx938) 走 pair32 内核, 对应 hipc_pair32
+layout: hipc_pair32
+
+# JSON 配置输出根目录(deepgemm 源码树的 configs 目录)
+#   - 留空 / null: 默认为本 yml 同目录
+#   - 绝对路径:直接使用
+#   - 相对路径:相对于本 yml 所在目录
+# 输出到 deepgemm 源码树:
+config_root: ../../deepgemm/configs

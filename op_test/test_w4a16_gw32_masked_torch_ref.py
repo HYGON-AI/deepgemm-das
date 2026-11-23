@@ -6,6 +6,7 @@ from triton import language as tl
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 import torch.distributed as dist
+import deep_ep
 # from moe_wna16.ops import moe_ll
 # from moe_wna16 import forward_moe_masked
 # from deepgemm import forward_moe_masked
@@ -492,12 +493,6 @@ def test_fp8_block_wise(num_experts, num_tokens, N, K):
             f"size_m={size_m}, N={N}, K={K}"
         )
         return
-
-    # m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs,rhs,masked_m,)
-    # print("print test_w4a16 date type")
-    # print(f"tokens dtype: {tokens.dtype}, device: {tokens.device}")
-    # print(f"weight_scale dtype: {weight_scale.dtype}, device: {weight_scale.device}")
-    # print(f"out dtype: {hip_out.dtype}, device: {hip_out.device}")
 
 
     hip_out = run_hip_once(

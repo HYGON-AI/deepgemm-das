@@ -18,16 +18,25 @@ hipify_python.HIPIFY_HEADER_FILE = ""
 dtk_version = get_dtk_version(ROCM_HOME)
 COMMON_SOURCES = [
     './csrc/common/deepgemm_ops.cpp',
-    './csrc/common/000_deep_gemm_torch_library_root.cu',
 ]
 
+# Every operator that is registered with pybind lives under csrc/arch/wrapper.
+# Those files are architecture-agnostic hosts: they detect the runtime GPU
+# architecture and forward to the implementation of the matching arch folder
+# (gfx928 / gfx92a / gfx936 / gfx938 / gfx936_gfx938_shared), or report that the arch
+# does not support the operator.
+WRAPPER_SOURCES = sorted(glob.glob('./csrc/arch/wrapper/*.cu'))
+
 GFX936_GFX938_SHARED_SOURCES = [
+    './csrc/arch/gfx936_gfx938_shared/mqa_logits/bf16/mqa_logits_bf16_interface.cu',
+    './csrc/arch/gfx936_gfx938_shared/mqa_logits/bf16/dispatch/launch.cu',
+    './csrc/arch/gfx936_gfx938_shared/mqa_logits/int8/mqa_logits_int8_interface.cu',
+    './csrc/arch/gfx936_gfx938_shared/mqa_logits/int8/dispatch/launch.cu',
     './csrc/arch/gfx936_gfx938_shared/asm_m_grouped_w16a16_gemm_nt_contiguous.cu',
     './csrc/arch/gfx936_gfx938_shared/asm_m_grouped_w8a8_gemm_nt_contiguous.cu',
     './csrc/arch/gfx936_gfx938_shared/low_latency_grouped_gemm.cu',
     './csrc/arch/gfx936_gfx938_shared/m_grouped_fp8_gemm_nt_maksed_low_latency.cu',
     './csrc/arch/gfx936_gfx938_shared/m_grouped_bf16_gemm_nt_masked.cu',
-    './csrc/arch/gfx936_gfx938_shared/m_grouped_bf16_gemm_nt_masked_hipc.cu',
     './csrc/arch/gfx936_gfx938_shared/m_grouped_w4a16_nt_masked.cu',
     './csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_contiguous_hipc.cu',
     './csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_masked.cu',
@@ -37,27 +46,55 @@ GFX936_GFX938_SHARED_SOURCES = [
     './csrc/arch/gfx936_gfx938_shared/m_grouped_wfp4a16_nt_contiguous.cu',
     './csrc/arch/gfx936_gfx938_shared/m_grouped_wfp4a16_nt_masked.cu',
     './csrc/arch/gfx936_gfx938_shared/w8a16_linear.cu',
-
+    './csrc/arch/gfx936/paged_mqa_logits/paged_mqa_logits_prefill.cu',
+    './csrc/arch/gfx936_gfx938_shared/paged_mqa_logits/paged_mqa_logits.cu',
+    './csrc/arch/gfx936_gfx938_shared/paged_mqa_logits/paged_sparse_mqa.cu',
+    './csrc/arch/gfx936_gfx938_shared/paged_mqa_logits/paged_mqa_logits_sparse.cu',
+    './csrc/arch/gfx936_gfx938_shared/paged_mqa_logits/paged_mqa_logits_grouped_sparse.cu',
+    './csrc/arch/gfx936_gfx938_shared/paged_mqa_logits/opus/paged_mqa_logits_opus.cu',
+    'csrc/arch/gfx936_gfx938_shared/m_grouped_int8_gemm_nt_masked_pair32.cu',
+    'csrc/arch/gfx936_gfx938_shared/m_grouped_int8_gemm_nt_contiguous_pair32.cu',
+    'csrc/arch/gfx936_gfx938_shared/mega_mhc.cu',
 ]
 
 GFX92a_SOURCES = [
+    './csrc/arch/gfx92a/tf32_hc_prenorm_gemm.cu',
+    './csrc/arch/gfx92a/fp8_gemm_hipc.cu',
+    # grouped gemm
     './csrc/arch/gfx92a/wfp4a16_contiguous_launch.cu',
     './csrc/arch/gfx92a/wfp4a16_masked_launch.cu',
-    './csrc/arch/gfx92a/m_grouped_fp8_gemm_nt_contiguous.cu',
-    # # 未完成
-    # './csrc/arch/gfx92a/m_grouped_w4a8_gemm_nt_contiguous.cu',
-    # # 测试
-    # './csrc/arch/gfx936_gfx938_shared/m_grouped_w8a8_gemm_nt_masked_hipc_persistent_kernel.cu',
+    './csrc/arch/gfx92a/m_grouped_w4a8_gemm_nt_contiguous_hipc.cu',
+    './csrc/arch/gfx92a/m_grouped_w4a8_gemm_nt_masked_hipc.cu',
+    './csrc/arch/gfx92a/m_grouped_fp8_gemm_nt_contiguous_pair32.cu',
+    './csrc/arch/gfx92a/m_grouped_fp8_gemm_nt_masked_pair32.cu',
+    './csrc/arch/gfx92a/m_grouped_int8_gemm_nt_contiguous_pair32.cu',
+    './csrc/arch/gfx92a/m_grouped_int8_gemm_nt_masked_pair32.cu',
+    # else
+    './csrc/arch/gfx92a/w8a16_linear.cu',
+    './csrc/arch/gfx92a/fp8_gemm.cu',
+]
+
+
+GFX928_SOURCES = [
+    './csrc/arch/gfx928/tf32_hc_prenorm_gemm.cu',
 ]
 
 
 GFX936_SOURCES = [
     './csrc/arch/gfx936/wfp4a16_contiguous_launch.cu',
     './csrc/arch/gfx936/wfp4a16_masked_launch.cu',
+    './csrc/arch/gfx936/tf32_hc_prenorm_gemm.cu',
 ]
 
 
 GFX938_SOURCES = [
+    './csrc/arch/gfx938/mqa_logits/mqa_logits_fp8_interface.cu',
+    './csrc/arch/gfx938/mqa_logits/dispatch/launch.cu',
+    './csrc/arch/gfx938/paged_mqa_logits/paged_sparse_mqa_fp8.cu',
+    './csrc/arch/gfx938/paged_mqa_logits/paged_mqa_logits_prefill_fp8.cu',
+    './csrc/arch/gfx938/paged_mqa_logits/paged_mqa_logits_grouped_sparse_fp8.cu',
+    './csrc/arch/gfx938/paged_mqa_logits/paged_mqa_logits_fp8.cu',
+    './csrc/arch/gfx938/paged_mqa_logits/opus/paged_mqa_logits_opus_fp8.cu',
     './csrc/arch/gfx938/asm_m_grouped_fp8_gemm_nt_contiguous.cu',
     './csrc/arch/gfx938/einsum.cu',
     './csrc/arch/gfx938/fp8_gemm.cu',
@@ -66,11 +103,14 @@ GFX938_SOURCES = [
     './csrc/arch/gfx938/m_grouped_fp8_gemm_nt_contiguous_optimized.cu',
     './csrc/arch/gfx938/m_grouped_i8_gemm_nt_contiguous_optimized.cu',
     './csrc/arch/gfx938/moe_w8a8_marlin_prefill_down_fp8.cu',
-    './csrc/arch/gfx938/tf32_hc_pernorm_gemm.cu',
+    './csrc/arch/gfx938/tf32_hc_prenorm_gemm.cu',
     './csrc/arch/gfx938/wfp4a16_contiguous_launch.cu',
     './csrc/arch/gfx938/wfp4a16_masked_launch.cu',
+    './csrc/arch/gfx938/m_grouped_fp8_gemm_nt_contiguous_pair32.cu',
+    './csrc/arch/gfx938/m_grouped_fp8_gemm_nt_masked_pair32.cu',
+    './csrc/arch/gfx938/m_grouped_fp8_gemm_nt_masked_pair32_v2.cu',
+    './csrc/arch/gfx938/m_grouped_fp8_gemm_nt_contiguous_wasp_pair32_v2.cu',
 ]
-
 
 SOURCE_SCAN_PATTERNS = [
     './csrc/*.cpp',
@@ -82,15 +122,19 @@ SOURCE_SCAN_PATTERNS = [
 
 SOURCE_GROUP_ORDER = [
     'common',
+    'wrapper',
     'gfx936_gfx938_shared',
     'gfx92a',
+    'gfx928',
     'gfx936',
     'gfx938',
 ]
 
 SOURCE_GROUPS: Dict[str, List[str]] = {
     'common': COMMON_SOURCES,
+    'wrapper': WRAPPER_SOURCES,
     'gfx936_gfx938_shared': GFX936_GFX938_SHARED_SOURCES,
+    'gfx928': GFX928_SOURCES,
     'gfx936': GFX936_SOURCES,
     'gfx938': GFX938_SOURCES,
     'gfx92a': GFX92a_SOURCES,
@@ -98,14 +142,26 @@ SOURCE_GROUPS: Dict[str, List[str]] = {
 
 SOURCE_GROUP_ARCHS: Dict[str, Optional[Sequence[str]]] = {
     'common': None,
-    'gfx936_gfx938_shared': ('gfx92a', 'gfx936', 'gfx938'),
+    'wrapper': None,
+    'gfx936_gfx938_shared': ('gfx936', 'gfx938'),
+    'gfx928': ('gfx928',),
     'gfx936': ('gfx936',),
     'gfx938': ('gfx938',),
     'gfx92a': ('gfx92a',),
 }
 
+SOURCE_EXCLUDED_ARCHS: Dict[str, Sequence[str]] = {
+    'csrc/arch/gfx936/paged_mqa_logits/paged_mqa_logits_prefill.cu': ('gfx92a',),
+    'csrc/arch/gfx936_gfx938_shared/m_grouped_w8a8_gemm_nt_contiguous_gfx936.cu': ('gfx938',),
+}
+
 _SOURCE_ARCHS_BY_PATH: Dict[str, List[str]] = {}
 _SOURCE_GROUP_BY_PATH: Dict[str, str] = {}
+# Arch flags for the extension currently being built. The same shared source
+# file can appear in multiple kernel libraries (e.g. gfx936 and gfx938), each
+# compiled with a different --offload-arch, so the mapping must be swapped
+# per extension (see BuildReleaseExtension.build_extensions).
+_ACTIVE_SOURCE_ARCHS: Dict[str, List[str]] = {}
 
 
 def _find_rocm_home() -> Optional[str]:
@@ -145,7 +201,7 @@ def _current_rocm_arch() -> Optional[str]:
 
 def _default_rocm_archs() -> List[str]:
     dtk_ver = int(str(dtk_version)[:4])
-    supported_archs = ['gfx936']
+    supported_archs = ['gfx928', 'gfx936']
     if dtk_ver >= 2604:  # dtk>=2604 can support gfx938
         supported_archs.append('gfx938')
     current_arch = _current_rocm_arch()
@@ -248,22 +304,16 @@ def _validate_source_groups(
         _normalize_source_path(source)
         for pattern in SOURCE_SCAN_PATTERNS
         for source in glob.glob(pattern, recursive=True)
+        if not source.endswith('_hip.cpp')  # Generated by PyTorch HIPify during an in-place build.
     )
 
-    if build_only_w8a16:
-        expected_sources = {
-            _normalize_source_path('./csrc/common/deepgemm_ops.cpp'),
-            _normalize_source_path('./csrc/arch/gfx936_gfx938_shared/w8a16_linear.cu'),
-        }
-        actual_sources = expected_sources
-    elif build_only_w4a8_masked:
-        expected_sources = {
-            _normalize_source_path('./csrc/common/deepgemm_ops.cpp'),
-            _normalize_source_path('./csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_masked.cu'),
-            _normalize_source_path('./csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_masked_hipc.cu'),
-            _normalize_source_path('./csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_contiguous_hipc.cu'),
-        }
-        actual_sources = expected_sources
+    if build_only_w8a16 or build_only_w4a8_masked:
+        # Specialized build modes compile a small subset of the sources on
+        # purpose; the full source list is not expected to be classified.
+        if duplicates:
+            raise RuntimeError('DeepGEMM source groups are out of sync; '
+                               'duplicate sources: ' + ', '.join(duplicates))
+        return
 
     missing_sources = sorted(actual_sources - expected_sources)
     stale_sources = sorted(expected_sources - actual_sources)
@@ -304,59 +354,94 @@ def _resolve_group_archs(group: str, target_archs: List[str]) -> List[str]:
     return [arch for arch in target_archs if arch in allowed_archs]
 
 
+def _resolve_source_archs(source: str, group_archs: List[str]) -> List[str]:
+    excluded_archs = SOURCE_EXCLUDED_ARCHS.get(_normalize_source_path(source), ())
+    if not excluded_archs:
+        return list(group_archs)
+    excluded = set(excluded_archs)
+    return [arch for arch in group_archs if arch not in excluded]
+
+
 def _remember_source_group(source: str, group: str, archs: List[str]) -> None:
     for variant in _source_path_variants(source):
         _SOURCE_ARCHS_BY_PATH[variant] = list(archs)
         _SOURCE_GROUP_BY_PATH[variant] = group
 
 
+BUILD_ONLY_W8A16_SOURCES = [
+    ('./csrc/common/deepgemm_ops.cpp', 'common'),
+    ('./csrc/arch/wrapper/w8a16_linear.cu', 'wrapper'),
+    ('./csrc/arch/gfx92a/w8a16_linear.cu', 'gfx92a'),
+    ('./csrc/arch/gfx936_gfx938_shared/w8a16_linear.cu', 'gfx936_gfx938_shared'),
+]
+
+BUILD_ONLY_W4A8_MASKED_SOURCES = [
+    ('./csrc/common/deepgemm_ops.cpp', 'common'),
+    ('./csrc/arch/wrapper/m_grouped_marlin_w4a8_gemm_nt_contiguous_hipc.cu', 'wrapper'),
+    ('./csrc/arch/wrapper/m_grouped_marlin_w4a8_gemm_nt_masked.cu', 'wrapper'),
+    ('./csrc/arch/wrapper/m_grouped_marlin_w4a8_gemm_nt_masked_hipc.cu', 'wrapper'),
+    ('./csrc/arch/gfx92a/m_grouped_w4a8_gemm_nt_contiguous_hipc.cu', 'gfx92a'),
+    ('./csrc/arch/gfx92a/m_grouped_w4a8_gemm_nt_masked_hipc.cu', 'gfx92a'),
+    ('./csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_contiguous_hipc.cu', 'gfx936_gfx938_shared'),
+    ('./csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_masked.cu', 'gfx936_gfx938_shared'),
+    ('./csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_masked_hipc.cu', 'gfx936_gfx938_shared'),
+]
+
+
 def _build_op_sources_and_archs(
     build_only_w8a16: bool,
     build_only_w4a8_masked: bool,
     target_archs: List[str],
-) -> List[str]:
+) -> Dict[str, object]:
+    """Collect every source of the extension together with its arch flags.
+
+    Everything is linked into a single library (deepgemm.op). The sources of an
+    arch folder are compiled with that folder's --offload-arch, which lets the
+    GPU code of several architectures coexist inside one module. Operator
+    symbols are isolated per architecture through their namespace.
+    """
     global _SOURCE_ARCHS_BY_PATH, _SOURCE_GROUP_BY_PATH
     _validate_source_groups(build_only_w8a16, build_only_w4a8_masked)
     _SOURCE_ARCHS_BY_PATH = {}
     _SOURCE_GROUP_BY_PATH = {}
 
     if build_only_w8a16:
-        op_files = [
-            './csrc/arch/gfx936_gfx938_shared/w8a16_linear.cu',
-            './csrc/common/deepgemm_ops.cpp',
-        ]
-        for source in op_files:
-            _remember_source_group(source, 'build_only_w8a16', list(target_archs))
-        return op_files
+        selected = BUILD_ONLY_W8A16_SOURCES
+    elif build_only_w4a8_masked:
+        selected = BUILD_ONLY_W4A8_MASKED_SOURCES
+    else:
+        _validate_requested_archs(target_archs)
+        selected = [(source, group)
+                    for group in SOURCE_GROUP_ORDER
+                    for source in SOURCE_GROUPS[group]]
 
-    if build_only_w4a8_masked:
-        op_files = [
-            './csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_masked.cu',
-            './csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_masked_hipc.cu',
-            './csrc/arch/gfx936_gfx938_shared/m_grouped_w4a8_gemm_nt_contiguous_hipc.cu',
-            './csrc/common/deepgemm_ops.cpp',
-        ]
-        for source in op_files:
-            _remember_source_group(source, 'build_only_w4a8_masked', list(target_archs))
-        return op_files
-
-    _validate_requested_archs(target_archs)
-    op_files: List[str] = []
-    for group in SOURCE_GROUP_ORDER:
-        group_sources = SOURCE_GROUPS[group]
-        if not group_sources:
-            continue
+    sources: List[str] = []
+    archs_by_source: Dict[str, List[str]] = {}
+    for source, group in selected:
         group_archs = _resolve_group_archs(group, target_archs)
-        if not group_archs:
+        source_archs = _resolve_source_archs(source, group_archs) if group_archs else []
+        if not source_archs:
             continue
-        _append_unique(op_files, group_sources)
-        for source in group_sources:
-            _remember_source_group(source, group, group_archs)
-    return op_files
+        _append_unique(sources, [source])
+        archs_by_source[source] = source_archs
+        _remember_source_group(source, group, source_archs)
+
+    if not sources:
+        raise RuntimeError(f'DeepGEMM has no source to build for target archs {target_archs}.')
+    return {'sources': sources, 'archs_by_source': archs_by_source}
+
+
+def _set_active_source_archs(source_archs: Dict[str, Sequence[str]]) -> None:
+    _ACTIVE_SOURCE_ARCHS.clear()
+    for source, archs in source_archs.items():
+        for variant in _source_path_variants(source):
+            _ACTIVE_SOURCE_ARCHS[variant] = list(archs)
 
 
 def _get_source_archs(path: str) -> List[str]:
     for variant in _source_path_variants(path):
+        if variant in _ACTIVE_SOURCE_ARCHS:
+            return _ACTIVE_SOURCE_ARCHS[variant]
         if variant in _SOURCE_ARCHS_BY_PATH:
             return _SOURCE_ARCHS_BY_PATH[variant]
     return _resolve_rocm_archs()
@@ -680,6 +765,21 @@ class BuildReleaseExtension(BuildExtension):
                                 shlex.quote(flag)
                                 for flag in _get_rocm_arch_flags_for_archs(source_archs, cuda_post_cflags)
                             ]
+                            # Preserve the imported OPUS HCU kernel's JIT device-code flags.
+                            if os.path.splitext(os.path.basename(source))[0] in (
+                                'paged_mqa_logits_opus', 'paged_mqa_logits_opus_fp8',
+                            ):
+                                arch_flags += [
+                                    '-std=c++20', '-fgpu-flush-denormals-to-zero',
+                                    '-fno-offload-uniform-block',
+                                    '-mllvm', '-amdgpu-kernarg-preload-count=16',
+                                    '-mllvm', '-lsr-drop-solution=1',
+                                    '-mllvm', '-amdgpu-coerce-illegal-types=1',
+                                    '-mllvm', '-amdgpu-early-inline-all=true',
+                                    '-mllvm', '-amdgpu-function-calls=false',
+                                    '-mllvm', '-enable-post-misched=0',
+                                    '-mllvm', '-support-768-vgprs=false',
+                                ]
                             for variant in _source_path_variants(source):
                                 cuda_arch_flags_by_source[variant] = arch_flags
                     cuda_cflags = [shlex.quote(f) for f in common_cflags]
@@ -702,19 +802,102 @@ class BuildReleaseExtension(BuildExtension):
             return other_objects
 
         self.compiler.compile = unix_wrap_ninja_compile
+        # Swap the per-extension source->arch map right before each extension
+        # is built, so shared sources get the right --offload-arch in each
+        # kernel library.
+        orig_build_extension = self.build_extension
+
+        def build_extension_with_arch_map(extension):
+            _set_active_source_archs(getattr(extension, '_dg_source_archs', None) or {})
+            orig_build_extension(extension)
+
+        self.build_extension = build_extension_with_arch_map  # type: ignore[method-assign]
         build_ext.build_extensions(self)
 
 def torch_version_over110():
     version=torch.__version__.split('.')
     return int(version[0])*100+int(version[1])>110
 
+def _get_megamoe_extension():
+    """HCU gfx938 MegaMoE (deepgemm.mega._C) — AOT unified LL/HT kernel.
+
+    Build-selection env vars (all optional):
+      DG_MEGA_BUILD_LL=0 / DG_MEGA_SKIP_LL=1        skip low-latency kernel
+      DG_MEGA_BUILD_HT=0 / DG_MEGA_SKIP_HT=1        skip high-throughput kernel
+      DG_MEGA_BUILD_INT8=1                           build INT8 instantiations
+                                                   (default: skipped)
+      DG_MEGA_SKIP_INT8=1                            force-skip INT8 (default)
+      SAVE_TEMPS=0                                   disable --save-temps
+      DG_MEGAMOE_DBUG=1 (+DG_DBUG_LEVEL=1|2)         device-side diagnostics
+      DG_MEGA_PROF=1 / DG_MEGA_PROF_BUILD=1          per-block phase profiling
+      DG_MEGA_HANG_PRINT=1                           hang-site diagnostics
+      DG_MEGA_GW_NORESCALE=1 / DG_MEGA_L1_NOQUANT=1  wrong-result experiments
+      DG_MEGA_W16_REGOPT=<mask>                      W16 register-pressure test
+    """
+    mega_cxx = ['-O3', '-w']
+    mega_nvcc = ['-O3', '-w', '-ffast-math', '-mllvm', '-support-768-vgprs=true',
+                 '-DHIP_ENABLE_WARP_SYNC_BUILTINS']
+    if torch_version_over110():
+        mega_nvcc.append('-DTORCH_VERSION_OVER_110')
+    if os.environ.get('SAVE_TEMPS', '1') == '1':
+        mega_nvcc.append('--save-temps')
+    # W16 register-pressure relief (gemm_device_ht.cuh).  Bit mask:
+    # 1 = 3 A-frag rotation slots, 2 = 4 fused-epilogue row rounds.
+    # The device header defaults to 3; setting the env (including 0)
+    # overrides it so the historical layout stays reachable for A/B.
+    if 'DG_MEGA_W16_REGOPT' in os.environ:
+        _regopt = '-DDG_MEGA_W16_REGOPT=' + os.environ['DG_MEGA_W16_REGOPT']
+        mega_cxx.append(_regopt)
+        mega_nvcc.append(_regopt)
+        print('[setup] DG_MEGA_W16_REGOPT=' + os.environ['DG_MEGA_W16_REGOPT'])
+    if os.environ.get('DG_MEGAMOE_DBUG', '0') == '1':
+        for flags in (mega_cxx, mega_nvcc):
+            flags.append('-DDG_MEGAMOE_DBUG=1')
+            flags.append('-DDG_DBUG_LEVEL=' + os.environ.get('DG_DBUG_LEVEL', '2'))
+        print('[setup] DG_MEGAMOE_DBUG=1 — MegaMoE device diagnostics enabled')
+    if os.environ.get('DG_MEGA_BUILD_LL', '1') == '0' or \
+            os.environ.get('DG_MEGA_SKIP_LL', '0') == '1':
+        mega_nvcc.append('-DDG_MEGA_SKIP_LL=1')
+        print('[setup] MegaMoE low-latency kernel skipped')
+    if os.environ.get('DG_MEGA_BUILD_HT', '1') == '0' or \
+            os.environ.get('DG_MEGA_SKIP_HT', '0') == '1':
+        mega_nvcc.append('-DDG_MEGA_SKIP_HT=1')
+        print('[setup] MegaMoE high-throughput kernel skipped')
+    if os.environ.get('DG_MEGA_BUILD_INT8', '0') != '1' or \
+            os.environ.get('DG_MEGA_SKIP_INT8', '0') == '1':
+        mega_nvcc.append('-DDG_MEGA_SKIP_INT8=1')
+    if os.environ.get('DG_MEGA_W12P_DBG', '0') == '1':
+        for flags in (mega_cxx, mega_nvcc):
+            flags.append('-DDG_MEGA_W12P_DBG=1')
+        print('[setup] MegaMoE L1 intermediate debug dump enabled (DG_MEGA_W12P_DBG=1)')
+    if os.environ.get('DG_MEGA_PROF', '0') == '1' or \
+            os.environ.get('DG_MEGA_PROF_BUILD', '0') == '1':
+        mega_cxx.append('-DDG_MEGA_PROF=1')
+        mega_nvcc.append('-DDG_MEGA_PROF=1')
+        print('[setup] MegaMoE per-block phase profiling compiled in')
+    for flag in ['DG_MEGA_HANG_PRINT', 'DG_MEGA_GW_NORESCALE',
+                 'DG_MEGA_L1_NOQUANT', 'DG_MEGA_GW_SWAPMG',
+                 'DG_MEGA_GWDUMP', 'DG_MEGA_HT_MG', 'DG_MEGA_HT_MG2',
+                 'DG_MEGA_DUMP_SILU']:
+        if os.environ.get(flag, '0') == '1':
+            mega_nvcc.append(f'-D{flag}=1')
+            print(f'[setup] MegaMoE diagnostic flag {flag}=1')
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    return CUDAExtension(
+        name='deepgemm.mega._C',
+        sources=[os.path.join('csrc', 'megamoe', 'mega_moe.cu')],
+        include_dirs=[
+            os.path.join(root, 'csrc', 'megamoe'),
+            os.path.join(root, 'csrc', 'megamoe', 'kernels'),
+        ],
+        extra_compile_args={'cxx': mega_cxx, 'nvcc': mega_nvcc},
+    )
+
 def get_extensions():
     extensions = []
     include_dirs = []
     library_dirs = []
-    define_macros = []
-    # 显式设置 TORCH_EXTENSION_NAME 宏，确保编译时正确设置
-    define_macros.append(('TORCH_EXTENSION_NAME', 'op'))
     build_only_w8a16 = os.environ.get("DEEPGEMM_BUILD_ONLY_W8A16") == "1"
     build_only_w4a8_masked = os.environ.get("DEEPGEMM_BUILD_ONLY_W4A8_MASKED") == "1"
     if build_only_w8a16 and build_only_w4a8_masked:
@@ -722,76 +905,72 @@ def get_extensions():
             "DEEPGEMM_BUILD_ONLY_W8A16 and "
             "DEEPGEMM_BUILD_ONLY_W4A8_MASKED are mutually exclusive"
         )
+    # Build-only modes keep a single specialized library.
+    build_only_macros: List[tuple] = []
     if build_only_w8a16:
-        define_macros.append(("DEEPGEMM_BUILD_ONLY_W8A16", "1"))
+        build_only_macros.append(("DEEPGEMM_BUILD_ONLY_W8A16", "1"))
     if build_only_w4a8_masked:
-        define_macros.append(("DEEPGEMM_BUILD_ONLY_W4A8_MASKED", "1"))
+        build_only_macros.append(("DEEPGEMM_BUILD_ONLY_W4A8_MASKED", "1"))
 
     target_archs = _resolve_rocm_archs()
-    enabled_archs = set(target_archs) if build_only_w8a16 else set()
-    if not build_only_w8a16:
-        for group in SOURCE_GROUP_ORDER:
-            if SOURCE_GROUPS[group]:
-                enabled_archs.update(_resolve_group_archs(group, target_archs))
-    if "gfx92a" in enabled_archs:
-        define_macros.append(("DEEPGEMM_ENABLE_GFX92A", "1"))
-    if "gfx936" in enabled_archs:
-        define_macros.append(("DEEPGEMM_ENABLE_GFX936", "1"))
-    if "gfx938" in enabled_archs:
-        define_macros.append(("DEEPGEMM_ENABLE_GFX938", "1"))
+    specs = _build_op_sources_and_archs(
+        build_only_w8a16, build_only_w4a8_masked, target_archs)
+    sources = specs['sources']
+    # Each operator file in csrc/arch/wrapper dispatches at runtime to the
+    # implementation of the detected arch, guarded by these macros, so they are
+    # defined for every build mode.
+    arch_define_macros: List[tuple] = [
+        (f'DEEPGEMM_ENABLE_{arch.upper()}', '1')
+        for arch in target_archs
+        if arch in ('gfx928', 'gfx92a', 'gfx936', 'gfx938')
+    ]
+    print(f'DeepGEMM target ROCm archs: {target_archs}')
+    print(f'DeepGEMM sources: {len(sources)}')
+
+    extension = CUDAExtension
+    rocm_home = _find_rocm_home()
+    include_dirs.append(rocm_home + '/hiprand/include')
+    include_dirs.append(rocm_home + '/rocrand/include')
+    include_dirs.append(os.path.abspath('./3rdparty/hipblaslt-install/include'))
+    include_dirs.append(rocm_home + '/hipblas/include')
+    include_dirs.append(os.path.abspath('./csrc/include/'))
+    include_dirs.append(os.path.abspath('./csrc/arch/wrapper/include/'))
+    include_dirs.append(os.path.abspath('./csrc/arch/gfx936_gfx938_shared/include/'))
+
+    # 添加库目录
+    library_dirs.append(os.path.abspath('./3rdparty/hipblaslt-install/include'))
+    if rocm_home:
+        library_dirs.append(rocm_home + '/lib')
+
     # 全局默认编译选项（移除链接选项，链接选项应该在 extra_link_args 中）
     extra_compile_args = {'cxx': ['-O3', '-w'], 'nvcc': ['-O3', '-w', '-mllvm', '-support-768-vgprs=true', '-DHIP_ENABLE_WARP_SYNC_BUILTINS']}
     if torch_version_over110():
         extra_compile_args['nvcc'].append('-DTORCH_VERSION_OVER_110')
-    
-    # 链接选项
-    extra_link_args = ['-ldl', '-lrocblas', '-lhipblaslt', '-lhipblas']
-    
-    op_files = _build_op_sources_and_archs(
-        build_only_w8a16, build_only_w4a8_masked, target_archs)
-    print(f'DeepGEMM target ROCm archs: {target_archs}')
-    if build_only_w8a16:
-        print(f'DeepGEMM source group build_only_w8a16: archs={target_archs}, sources={len(op_files)}')
-    elif build_only_w4a8_masked:
-        print(f'DeepGEMM source group build_only_w4a8_masked: archs={target_archs}, sources={len(op_files)}')
-    else:
-        for group in SOURCE_GROUP_ORDER:
-            group_sources = SOURCE_GROUPS[group]
-            if not group_sources:
-                continue
-            group_archs = _resolve_group_archs(group, target_archs)
-            if not group_archs:
-                print(f'DeepGEMM source group {group}: skipped, sources={len(group_sources)}')
-                continue
-            print(
-                f'DeepGEMM source group {group}: '
-                f'archs={group_archs}, sources={len(group_sources)}'
-            )
-    extension = CUDAExtension
-    rocm_home=_find_rocm_home()
-    include_dirs.append(rocm_home+'/hiprand/include')
-    include_dirs.append(rocm_home+'/hiprand/include')
-    include_dirs.append(rocm_home+'/rocrand/include')
-    include_dirs.append(os.path.abspath('./3rdparty/hipblaslt-install/include'))
-    include_dirs.append(rocm_home+'/hipblas/include')
-    include_dirs.append(os.path.abspath('./csrc/include/'))
-    include_dirs.append(os.path.abspath('./csrc/arch/gfx936_gfx938_shared/include/'))
-    
-    # 添加库目录
-    library_dirs.append(os.path.abspath('./3rdparty/hipblaslt-install/include'))
-    if rocm_home:
-        library_dirs.append(rocm_home+'/lib')
-    
+
+    # Single library: the pybind bindings of csrc/arch/wrapper, the shared
+    # host dispatch code and the kernels of every target arch. Each source is
+    # compiled with the --offload-arch of the arch folder it belongs to.
     ext_ops = extension(
         name="deepgemm.op",
-        sources=op_files,
+        sources=sources,
         include_dirs=include_dirs,
         library_dirs=library_dirs,
-        define_macros=define_macros,
+        define_macros=build_only_macros + arch_define_macros,
         extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args)
-
+        extra_link_args=['-lrocblas', '-lhipblaslt', '-lhipblas'])
+    ext_ops._dg_source_archs = dict(specs['archs_by_source'])
     extensions.append(ext_ops)
+
+    # MegaMoE kernels are gfx938-only: skip the deepgemm.mega._C extension
+    # entirely on other archs (deepgemm.mega still imports, but SymmBuffer
+    # creation raises a not-supported error).
+    if "gfx938" in target_archs:
+        extensions.append(_get_megamoe_extension())
+    else:
+        print(
+            f'DeepGEMM MegaMoE skipped: unsupported archs {target_archs} '
+            '(gfx938 only)'
+        )
     return extensions
 
 def _get_pytorch_version():
@@ -814,15 +993,18 @@ setup(
             "hsa/*/*/*/*",
             "hsa/*/*/*/*/*",
             "configs/*.json",
+            "configs/*/*.json",
             "configs/*/*/*.json",
+            "configs/*/*/*/*.json",
         ]
     },
     ext_modules=get_extensions(),
     cmdclass={
         'build_ext': BuildReleaseExtension
     },
+    license_files=['LICENSE', 'LICENSES/*', 'THIRD_PARTY_NOTICES.md'],
     zip_safe=False,
     install_requires=[
-         "torch==2.10.0",
+         "torch==2.13.0",
      ],
 )

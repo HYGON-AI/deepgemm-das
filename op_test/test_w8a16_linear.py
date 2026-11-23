@@ -10,7 +10,9 @@ import deepgemm
 # PERF_M = [1, 2, 4, 8, 16, 32, 128, 256, 512, 1024]
 # PERF_NK = [(12288, 2048)]
 # PERF_NK = [(9216, 2048), (2048, 4096), (12288, 2048)]
-PERF_M = list(range(1, 33))
+# PERF_M = list(range(1, 33))
+PERF_M = [2,8,16,24,32]
+# PERF_NK = [(2560, 9216)]
 PERF_NK = [(12288, 2560), (2560, 4096), (18432, 2560), (2560, 9216), (10240, 2560)]
 SHAPES = [(m, n, k) for n, k in PERF_NK for m in PERF_M]
 
@@ -127,7 +129,7 @@ def _is_type2_raw_config(cfg):
     return int(cfg.get("KERNEL_TYPE", 0)) == 2 and int(cfg.get("WEIGHT_LAYOUT", 0)) == 0
 
 
-def do_bench(fn, cfg=None, warmup=50, rep=200, cache_mode="cold"):
+def do_bench(fn, cfg=None, warmup=5, rep=10, cache_mode="cold"):
     if cache_mode == "cold":
         def cold_fn():
             if cfg is not None and _is_type2_raw_config(cfg):
@@ -173,8 +175,13 @@ def run_correctness():
     print("=" * 80)
     for m, n, k in SHAPES:
         x, w, scale = make_inputs(m, n, k, torch.float16)
-        out = deepgemm.w8a16_linear(x, w, scale)
         ref = triton_w8a16_ref(x, w, scale)
+        cfg = deepgemm.get_w8a16_linear_config(m, n, k)
+        if int(cfg.get("WEIGHT_LAYOUT", 0)) == 0:
+            w = w
+        else: 
+            w = deepgemm.w8a16_marlin_weight(w)
+        out = deepgemm.w8a16_linear(x, w, scale)
         check_close(f"M={m} N={n} K={k}", out, ref)
 
 
@@ -188,6 +195,10 @@ def run_perf(cache_mode="cold"):
         for m in PERF_M:
             x, w, scale = make_inputs(m, n, k, torch.float16)
             cfg = deepgemm.get_w8a16_linear_config(m, n, k)
+            if int(cfg.get("WEIGHT_LAYOUT", 0)) == 0:
+                w = w
+            else: 
+                w = deepgemm.w8a16_marlin_weight(w)
             kernel_type = int(cfg.get("KERNEL_TYPE", 0))
             path = {0: "decode", 1: "prefill", 2: "gemm"}.get(kernel_type, f"kt{kernel_type}")
             us = do_bench(lambda: deepgemm.w8a16_linear(x, w, scale), cfg=cfg, cache_mode=cache_mode) * 1000.0

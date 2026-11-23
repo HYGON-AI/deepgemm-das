@@ -24,19 +24,3 @@ torch::Tensor group_gemm_w4a16_masked(
       matrix_a, matrix_b, matrixb_scale, actual_tokens, matrix_c, max_tokens, experts);
   return matrix_c;
 }
-
-TORCH_LIBRARY_FRAGMENT(deep_gemm, m)
-{
-  m.def(
-      "low_latency_w4a16_gemm("
-      "Tensor matrix_a, "
-      "Tensor matrix_b, "
-      "Tensor matrix_b_scale, "
-      "Tensor actual_tokens, "
-      "Tensor! matrix_c, "
-      "int max_tokens, "
-      "int experts "
-      ") -> (Tensor)"
-  );
-  m.impl("low_latency_w4a16_gemm", torch::kCUDA, &group_gemm_w4a16_masked);
-}

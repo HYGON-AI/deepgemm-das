@@ -5,6 +5,7 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 #include <torch/extension.h>
+#include "gemm.h"
 
 #include <mutex>
 #include <unordered_map>
@@ -12,6 +13,8 @@
 #include <tuple>
 #include <sstream>
 
+
+namespace {
 
 hipblasOperation_t get_transpose(char trans){
     if(trans == 'N' || trans == 'n')
@@ -133,7 +136,9 @@ hipblasComputeType_t getComputeType(const at::Tensor& t)
 }
 
 
-namespace deepgemm {
+}  // namespace
+
+namespace gfx938::deepgemm {
 void fp8_gemm(
                     torch::Tensor mat_a,
                     torch::Tensor mat_b,

@@ -30,7 +30,6 @@ def run_contiguous_w8a8_int8_non_shuffle_unique():
         packed_b = marlin_i8_contiguous_weight(
             b_int8,
             shuffle_unique=SHUFFLE_UNIQUE,
-            low_memory=True,
         )
         b = [packed_b, b_scale]
 

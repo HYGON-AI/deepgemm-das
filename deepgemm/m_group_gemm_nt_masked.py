@@ -2,6 +2,7 @@ import torch
 from typing import Optional, Dict, Any, List, NamedTuple, Tuple
 import functools
 import os
+
 from . import op
 from .config_deepgemm import gemm_deepgemm_masked_config
 from .config import get_deepgemm_groupgemm_w8a8_config
@@ -12,11 +13,16 @@ from .group_gemm_weight_pack import (
     I8_LAYOUT_MODE_MASKED_LAYOUT_ASM,
     I8_LAYOUT_MODE_W6_HIPC,
     _get_current_gfx_arch,
-    _is_gfx936_contiguous_arch,
-    _resolve_i8_layout_mode_from_config,
     _resolve_shuffle_unique,
 )
-from .configs.w4a8_masked_hipc import select_w4a8_hipc_masked_mode
+from .configs.w4a8_masked_hipc import (
+    DEFAULT_W4A8_HIPC_MASKED_MODE,
+    select_w4a8_hipc_masked_config,
+    select_w4a8_hipc_masked_mode,
+)
+from .configs.bf16_masked import select_bf16_masked_mode
+
+from .configs.w8a8_masked import select_w8a8_masked_mode
 
 
 _MASKED_MARLIN2_INTERNAL_MODE = 1002
@@ -129,20 +135,30 @@ def m_grouped_w4a8_gemm_nt_masked_hipc(a: tuple[torch.Tensor, torch.Tensor],
                                        d: torch.Tensor,
                                        masked_m: torch.Tensor,
                                        expected_m_per_group: int,
-                                       config: Optional[Dict[str, Any]] = None) -> torch.Tensor:
+                                       config: Optional[Dict[str, Any]] = None,
+                                       *,
+                                       enable_overlap: bool = False,
+                                       signal: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     if config is not None and 'MODE' in config:
-        mode = config['MODE']
+        selected_config = config
     else:
-        mode = _select_w4a8_hipc_masked_mode(
-            expected_m_per_group, d.shape[2], a[0].shape[2]
+        selected_config = select_w4a8_hipc_masked_config(
+            expected_m_per_group, d.shape[2], a[0].shape[2], a[0].shape[0]
         )
+    mode = int(selected_config.get('MODE', DEFAULT_W4A8_HIPC_MASKED_MODE))
+    persistent_multiplier = int(selected_config.get('PERSISTENT_MULTIPLIER', 0))
     input, a_scale = a
     b_qweight, b_scale = b
     output = d
-    op.m_grouped_marlin_w4a8_gemm_nt_masked_hipc(input, b_qweight, output, a_scale, b_scale,
-                                             masked_m, expected_m_per_group, mode)
-    return output
+    # 返回 (block_m, ceil_div(N, block_n))：signal 形状为 E * ceil_div(M / 64)，
+    # 槽位按 64 行粒度组织。block_m<64 时一个槽位聚合 64/block_m 个 m tile，
+    # 槽位计数值达到 (64/block_m) * ceil_div(N, block_n) 即表示专家 e 第 m64 个
+    # 64 行带全部写回完成（valid_m 不足 64 行的末带由内核补齐差额）。
+    return op.m_grouped_marlin_w4a8_gemm_nt_masked_hipc(input, b_qweight, output, a_scale, b_scale,
+                                             masked_m, expected_m_per_group, mode,
+                                             persistent_multiplier,
+                                             enable_overlap, signal)
 
 
 
@@ -159,11 +175,14 @@ def m_grouped_w8a8_gemm_nt_masked(a: tuple[torch.Tensor, torch.Tensor],
         raise RuntimeError("m_grouped_w8a8_gemm_nt_masked overlap mode has been removed")
     if signal is not None:
         raise RuntimeError("signal is only valid for the removed m_grouped_w8a8_gemm_nt_masked overlap mode")
-    if config is not None and "MODE" in config:
-        mode = config["MODE"]
+
+    if config is not None and 'MODE' in config:
+        mode = config['MODE']
     else:
-        size_k = a[0].shape[2]
-        mode = deepgemm_masked_config_i8fp8(expected_m_per_group, size_k)  # topk*(bs*ep16) / 256  -> bs / 2
+        mode = select_w8a8_masked_mode(
+            expected_m_per_group, d.shape[2], a[0].shape[2], a[0].shape[0], "asm"
+        )
+
     input, a_scale = a
     b_qweight, b_scale = b
     output = d
@@ -207,6 +226,76 @@ def m_grouped_w8a8_gemm_nt_compact_masked(
         expected_m_per_group,
     )
 
+def m_grouped_int8_gemm_nt_masked_pair32(
+    a: tuple[torch.Tensor, torch.Tensor],
+    b: tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m_per_group: int,
+    config: Optional[Dict[str, Any]] = None
+) -> torch.Tensor:
+
+    experts = int(a[0].shape[0])
+    matrix_a, a_scale = a
+    matrix_b, b_scale = b
+
+    if config is not None and 'MODE' in config:
+        mode = config['MODE']
+    else:
+        mode = select_w8a8_masked_mode(
+            expected_m_per_group, d.shape[2], a[0].shape[2], a[0].shape[0], "hipc_pair32"
+        )
+
+    expected_m_per_group = int(expected_m_per_group)
+
+    op.m_grouped_int8_gemm_nt_masked_pair32(
+        matrix_a,
+        matrix_b,
+        a_scale,
+        b_scale,
+        masked_m,
+        d,
+        mode,
+    )
+    return d
+    
+
+
+def m_grouped_fp8_gemm_nt_masked_pair32_v2(
+    a: tuple[torch.Tensor, torch.Tensor],
+    b: tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m_per_group: int,
+    enable_overlap: bool = False,
+    signal: Optional[torch.Tensor] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> torch.Tensor:
+
+    matrix_a, a_scale = a
+    matrix_b, b_scale = b
+
+    expected_m_per_group = int(expected_m_per_group)
+    if config is not None and 'MODE' in config:
+        mode = config['MODE']
+    else:
+        mode = select_w8a8_masked_mode(
+            expected_m_per_group, d.shape[2], matrix_a.shape[2], matrix_a.shape[0], "hipc_pair32_v2"
+        )
+
+    return op.m_grouped_fp8_gemm_nt_masked_pair32_v2(
+        matrix_a,
+        matrix_b,
+        a_scale,
+        b_scale,
+        masked_m,
+        d,
+        enable_overlap,
+        signal,
+        mode
+    )
+
+
 
 def m_grouped_i8_gemm_nt_masked(
     a: tuple[torch.Tensor, torch.Tensor],
@@ -226,62 +315,70 @@ def m_grouped_i8_gemm_nt_masked(
     if masked_m.dtype != torch.int32:
         raise ValueError(f"masked_m must be torch.int32, got {masked_m.dtype}")
 
-    if arch == "gfx938":
-        return m_grouped_w8a8_gemm_nt_masked_ll(
-            a,
-            b,
-            d,
-            masked_m,
-            expected_m_per_group,
-            config,
-            block_wise=block_wise,
-            cu=cu,
+    return m_grouped_int8_gemm_nt_masked_pair32(
+                            a, b, d, masked_m, expected_m_per_group, config)
+                
+    raise RuntimeError(
+        f"m_grouped_i8_gemm_nt_masked does not support GPU arch {arch}; "
+        "expected gfx936/gfx92a/gfx928 or gfx938"
+    )
+
+def m_grouped_fp8_gemm_nt_masked_pair32(
+    a: tuple[torch.Tensor, torch.Tensor],
+    b: tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m_per_group: int,
+    enable_overlap: bool = False,
+    signal: Optional[torch.Tensor] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> torch.Tensor:
+
+    matrix_a, a_scale = a
+    matrix_b, b_scale = b
+
+    expected_m_per_group = int(expected_m_per_group)
+    if config is not None and 'MODE' in config:
+        mode = config['MODE']
+    else:
+        mode = select_w8a8_masked_mode(
+            expected_m_per_group, d.shape[2], matrix_a.shape[2], matrix_a.shape[0], "hipc_pair32"
         )
 
-    if not _is_gfx936_contiguous_arch(arch):
-        raise RuntimeError(
-            f"m_grouped_i8_gemm_nt_masked does not support GPU arch {arch}; "
-            "expected gfx936/gfx92a/gfx928 or gfx938"
-        )
+    return op.m_grouped_fp8_gemm_nt_masked_pair32(
+        matrix_a,
+        matrix_b,
+        a_scale,
+        b_scale,
+        masked_m,
+        d,
+        enable_overlap,
+        signal,
+        mode
+    )
+    
 
-    shuffle_unique = _resolve_shuffle_unique(shuffle_unique)
-    if shuffle_unique != 1:
-        if arch == "gfx92a":
-            raise AssertionError(
-                f"m_grouped_i8_gemm_nt_masked does not support shuffle_unique={shuffle_unique} on gfx92a"
-            )
-        return _i8_masked_layout_asm_impl(
-            a, b, d, masked_m, expected_m_per_group, config
+def m_grouped_fp8_gemm_nt_masked(
+    a: tuple[torch.Tensor, torch.Tensor],
+    b: tuple[torch.Tensor, torch.Tensor],
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m_per_group: int,
+    enable_overlap: bool = False,
+    signal: Optional[torch.Tensor] = None,
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    block_wise: bool = False,
+    cu: Optional[int] = None,
+) -> torch.Tensor:
+    if _get_current_gfx_arch() == "gfx938":
+        return m_grouped_fp8_gemm_nt_masked_pair32_v2(
+            a, b, d, masked_m, expected_m_per_group,
+            enable_overlap, signal, config=config,
         )
-
-    mode = _resolve_i8_layout_mode_from_config(config)
-    if mode == I8_LAYOUT_MODE_W6_HIPC:
-        return _i8_w6_hipc_layout_impl(
-            a,
-            b,
-            d,
-            masked_m,
-            expected_m_per_group,
-            block_wise=block_wise,
-            cu=128 if cu is None else cu,
-        )
-
-    if mode == I8_LAYOUT_MODE_MASKED_LAYOUT_ASM:
-        if arch != "gfx936":
-            raise AssertionError(
-                "m_grouped_i8_gemm_nt_masked mode=2 is only implemented for gfx936"
-            )
-        return _i8_masked_layout_asm_impl(
-            a,
-            b,
-            d,
-            masked_m,
-            expected_m_per_group,
-            {"MODE": _MASKED_MARLIN2_INTERNAL_MODE},
-        )
-
-    return _i8_masked_layout_asm_impl(
-        a, b, d, masked_m, expected_m_per_group, config
+    return m_grouped_fp8_gemm_nt_masked_pair32(
+        a, b, d, masked_m, expected_m_per_group,
+        enable_overlap, signal, config=config,
     )
 
 
@@ -303,51 +400,8 @@ def _i8_masked_layout_asm_impl(
         d,
         masked_m,
         expected_m_per_group,
-        {"MODE": _MASKED_MARLIN2_INTERNAL_MODE} if config is None else config,
+        config,
     )
-
-
-def _i8_w6_hipc_layout_impl(
-    a: tuple[torch.Tensor, torch.Tensor],
-    b: tuple[torch.Tensor, torch.Tensor],
-    d: torch.Tensor,
-    masked_m: torch.Tensor,
-    expected_m_per_group: int,
-    *,
-    block_wise: bool = False,
-    cu: int = 128,
-) -> torch.Tensor:
-    input, a_scale = a
-    b_qweight, b_scale = b
-    if masked_m.dtype != torch.int32:
-        raise ValueError(f"masked_m must be torch.int32, got {masked_m.dtype}")
-    if b_qweight.dim() != 6:
-        raise ValueError("unified masked int8 weight expects packed weight [E,K/64,N/16,4,16,16]")
-
-    if not block_wise:
-        if a_scale.dim() == 3:
-            if a_scale.size(-1) != 1:
-                raise ValueError(f"a_scale must be [E,M] or [E,M,1], got {tuple(a_scale.shape)}")
-            a_scale = a_scale.squeeze(-1)
-        if b_scale.dim() == 3:
-            if b_scale.size(-1) != 1:
-                raise ValueError(f"b_scale must be [E,N] or [E,N,1], got {tuple(b_scale.shape)}")
-            b_scale = b_scale.squeeze(-1)
-    torch.ops.deep_gemm.m_grouped_w8a8_gemm_nt_masked_gfx936(
-        input,
-        b_qweight,
-        a_scale.contiguous(),
-        b_scale.contiguous(),
-        masked_m.contiguous(),
-        d,
-        int(expected_m_per_group),
-        int(input.size(0)),
-        int(cu),
-        bool(block_wise),
-        False,
-        None,
-    )
-    return d
 
 def m_grouped_w8a8_gemm_nt_masked_gfx936(
     a: tuple[torch.Tensor, torch.Tensor],
@@ -382,24 +436,12 @@ def m_grouped_bf16_gemm_nt_masked(a: torch.Tensor,
                                   expected_m_per_group: int,
                                   config: Optional[Dict[str, Any]] = None) -> torch.Tensor:
 
-    config = config or {}
-    mode = int(config.get("MODE", _BF16_MASKED_BM64_BN256_BK128_MODE))
-    if mode in _BF16_MASKED_BM64_BN256_BK128_MODES:
-        if config.get("WEIGHT_LAYOUT") != BF16_MASKED_BM64_BN256_BK128_LAYOUT or not config.get("PACKED_WEIGHT", False):
-            raise ValueError(
-                "BF16 masked BM64/BN256/BK128 kernels require pre-packed weights. "
-                "Use pack_bf16_masked_weight(weight, mode) and pass the returned config."
+    if config is not None and 'MODE' in config:
+        mode = config['MODE']
+    else:
+        mode = select_bf16_masked_mode(
+                expected_m_per_group, d.shape[2], a.shape[2], a.shape[0]
             )
     op.m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, mode)
-    return d   
+    return d    
 
-def m_grouped_bf16_gemm_nt_masked_hipc(a: torch.Tensor,
-                                  b: torch.Tensor,
-                                  d: torch.Tensor,
-                                  masked_m: torch.Tensor,
-                                  expected_m_per_group: int,
-                                  config: Optional[Dict[str, Any]] = {"MODE": 1000,}) -> torch.Tensor:
-
-    mode = config['MODE']
-    op.m_grouped_bf16_gemm_nt_masked_hipc(a, b, d, masked_m, expected_m_per_group, mode)
-    return d  

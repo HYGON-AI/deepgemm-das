@@ -1,0 +1,45 @@
+# masked tune 的矩阵/形状扫描配置(w4a8 / w8a8_int8_shuffle_unique 共用)
+# 仅描述"要跑哪些 case",与 MODE / GPU / 迭代次数等运行参数解耦
+# 由各 tune 的 cfg yml (tune_cfg.yml / tune_w8a8_int8_shuffle_unique_cfg.yml)
+# 里的 `cases:` 字段引用(默认相对该 cfg yml 所在目录解析)
+
+# 需要扫描的 expert 数
+e_list:
+  - 8
+  - 9
+  - 16
+  - 18
+  - 28
+  - 32
+  - 56
+
+# 需要扫描的 (N, K) 形状
+shapes:
+  # w4a8 常用形状
+  - [4096, 2048]
+  - [4096, 4096]
+  - [4096, 6144]
+  - [6144, 2048]
+  # w8a8_int8 (参考 unified_test/masked_cases.py)
+  - [2048, 6144]     # masked_up
+  - [6144, 1024]     # masked_down
+
+# 每个 shape 下要枚举的 expected_m 列表
+expected:
+  - 1
+  - 2
+  - 4
+  - 6
+  - 8
+  - 14
+  - 16
+  - 32
+  - 56
+  - 64
+  - 84
+  - 112
+  - 128
+  - 256
+  - 512
+  - 1024
+  - 2048

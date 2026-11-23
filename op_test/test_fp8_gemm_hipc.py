@@ -58,7 +58,7 @@ BIG_ACCURACY_SHAPES = [
     (4096, 1024, 8192),    # 大 K
     (1024, 4096, 8192),    # 大 N、大 K
     (8192, 8192, 2048),    # 最大 M x N
-    (1408, 3072, 2432),    # 大但 M/K 非对齐：M tail + K tail
+    (1408, 3072, 2384),    # 大但 M/K 非对齐：M tail + K tail
 ]
 
 # 性能用例（大 shape，bench 模式）
@@ -133,6 +133,35 @@ def _test_accuracy_once(M: int, N: int, K: int):
 def test_accuracy_big_2d(M, N, K):
     """大 shape 2D FP8 GEMM 精度测试：与 fp32 参考 allclose。"""
     _test_accuracy_once(M, N, K)
+
+
+def test_accuracy_big_2d_k_tail_no_oob_read():
+    """K-tail 回归：consumer 的 B 加载不得读到 B 张量末尾之外的字节。
+
+    K=2384 有 80 字节 K-tail，完整无效 B chunk 必须被 mask，不能读到最后一行
+    之后的 NaN。这里在 B 之后多放一行 NaN，验证它不会传播到输出。
+    """
+    M, N, K = 1408, 3072, 2384
+    a = _fp8_tensor(M, K)
+    b_big = _fp8_tensor(N + 1, K)
+    b_big[N] = float("nan")   # B 张量末尾之后的一行：越界读的目标
+    b = b_big[:N]
+    d = torch.empty(M, N, device=DEVICE, dtype=torch.bfloat16)
+    fp8_gemm_hipc((a, _identity_scale(M)), (b, _identity_scale(N)), d)
+    torch.cuda.synchronize()
+
+    ref = torch_fp8_gemm_ref(a, b).to(torch.bfloat16)
+    d_f, ref_f = d.float(), ref.float()
+    n_nan = int(torch.isnan(d_f).sum())
+    assert n_nan == 0, f"B 张量外的 NaN 被读入输出: {n_nan} 个 (K-tail OOB 读)"
+    max_abs = ref_f.abs().max().item()
+    tol = max(1.0, 1e-2 * max_abs)
+    max_diff = (d_f - ref_f).abs().max().item()
+    assert max_diff <= tol, (
+        f"M={M}, N={N}, K={K}: max_diff={max_diff:.6g} > atol={tol:.6g} "
+        f"(|ref|max={max_abs:.6g})")
+    print(f"fp8_gemm_hipc K-tail OOB 回归 M={M}, N={N}, K={K}: OK "
+          f"(max_diff={max_diff:.6g}, atol={tol:.6g})")
 
 
 def _measure_ms(run, M: int, N: int, K: int, warmup: int = 25,

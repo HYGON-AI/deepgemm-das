@@ -24,7 +24,7 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 #include "fp8_gemm_hipc.h"
-#include "gemm.h"  // deepgemm::fp8_gemm_hipc declaration
+namespace gfx938 {
 
 using bhalf_t   = __hip_bfloat16;
 using half_t    = __half;
@@ -1114,6 +1114,7 @@ __device__ __forceinline__ void gemm_epilogue_writeback_f32(
 // (3 barriers); without, the tail is a plain 2-barrier idle. Producers and
 // consumers read the same pointer, so barrier counts stay matched.
 // ============================================================================
+template<bool kTailTile>
 __device__ __forceinline__ void producer_body(
     const DeepGemm_params& params,
     int prod_id,
@@ -1316,7 +1317,7 @@ __device__ __forceinline__ void producer_body(
 // ============================================================================
 // Consumer body
 // ============================================================================
-template<typename Element_O>
+template<bool kTailTile, typename Element_O>
 __device__ __forceinline__ void consumer_body(
     const DeepGemm_params& params,
     int consumer_id,
@@ -1463,10 +1464,21 @@ __device__ __forceinline__ void consumer_body(
     // SGPR soffset holds the stage-varying col_base. Effective addr = rsrc +
     // v_off + s_col_base.
     //
-    // No OOB mask on B: producer_body guarantees that A LDS is zero for every
-    // k >= K, using hardware zero-fill for complete chunks and explicit LDS
-    // clearing for the one chunk that can straddle K. Therefore B values read
-    // past K multiply by zero. This avoids per-stage B-tail masking.
+    // K-tail safety (kTailTile instantiations only — see buffer_load_b): in the
+    // last (partial) K-stage a chunk covers [k_last_stage*kStageK + k_local, +16)
+    // with k_local = col_group*16 + k_half*kPassK. A chunk with k_local >=
+    // k_left_last lies entirely at k >= K. A LDS is zero there, so B's value is
+    // irrelevant — BUT for the LAST B row (n == N-1) those bytes live past the
+    // end of the B tensor, and the OOB read returns adjacent-memory garbage:
+    // if that garbage is an fp8 NaN (0x7f/0xff), 0 * NaN = NaN poisons the
+    // whole output column (a data/allocator-dependent random failure, e.g.
+    // test_fp8_gemm_hipc M=1408, N=3072, K=2384 flaking on the last column).
+    // Such chunks take the bit-31 OOB mask (load returns 0 — same trick as the
+    // producer's A loads). The condition is row-independent: for n < N-1 the
+    // same bytes are the next row's data (finite), and A is zero at k >= K
+    // either way. Only the last N-tile's blocks need it, so the non-tail
+    // instantiation keeps the original (unmasked) codegen.
+    constexpr uint32_t b_tail_mask = 0x80000000u;
     const int n0 = b_col_start + 0 * kMmacN + row_in_tile;
     const int n1 = b_col_start + 1 * kMmacN + row_in_tile;
     const uint32_t v_off_n0_kh0 = (uint32_t)(n0 * ldb + col_group * 16 + 0 * kPassK);
@@ -1476,17 +1488,38 @@ __device__ __forceinline__ void consumer_body(
 
     // 4 x buffer_load_dwordx4: full 128K x 32N stripe into b_regs[BUF] in
     // one asm block. Layout matches d4[n * 2 + k_half].
+    //
+    // kTailTile masks only fully OOB chunks. A is zero in those positions, so
+    // B is irrelevant except on the final B row, where the mask prevents an
+    // out-of-resource vector load from introducing NaNs.
     auto buffer_load_b = [&]<int BUF>(int stage_id) {
         const uint32_t s_col_base = (uint32_t)(stage_id * kStageK);
-        buffer_load_dwordx4_x4_soff(
-            b_rsrc,
-            v_off_n0_kh0, v_off_n0_kh1,
-            v_off_n1_kh0, v_off_n1_kh1,
-            s_col_base,
-            b_regs[BUF].d4[0],   // n=0, k_half=0
-            b_regs[BUF].d4[1],   // n=0, k_half=1
-            b_regs[BUF].d4[2],   // n=1, k_half=0
-            b_regs[BUF].d4[3]);  // n=1, k_half=1
+        if constexpr (kTailTile) {
+            const uint32_t k_base = s_col_base;
+            const uint32_t m_kh0 = (k_base + (uint32_t)(col_group * 16 + 0 * kPassK)
+                                    >= (uint32_t)params.k) ? b_tail_mask : 0u;
+            const uint32_t m_kh1 = (k_base + (uint32_t)(col_group * 16 + 1 * kPassK)
+                                    >= (uint32_t)params.k) ? b_tail_mask : 0u;
+            buffer_load_dwordx4_x4_soff(
+                b_rsrc,
+                v_off_n0_kh0 | m_kh0, v_off_n0_kh1 | m_kh1,
+                v_off_n1_kh0 | m_kh0, v_off_n1_kh1 | m_kh1,
+                s_col_base,
+                b_regs[BUF].d4[0],   // n=0, k_half=0
+                b_regs[BUF].d4[1],   // n=0, k_half=1
+                b_regs[BUF].d4[2],   // n=1, k_half=0
+                b_regs[BUF].d4[3]);  // n=1, k_half=1
+        } else {
+            buffer_load_dwordx4_x4_soff(
+                b_rsrc,
+                v_off_n0_kh0, v_off_n0_kh1,
+                v_off_n1_kh0, v_off_n1_kh1,
+                s_col_base,
+                b_regs[BUF].d4[0],   // n=0, k_half=0
+                b_regs[BUF].d4[1],   // n=0, k_half=1
+                b_regs[BUF].d4[2],   // n=1, k_half=0
+                b_regs[BUF].d4[3]);  // n=1, k_half=1
+        }
     };
 
     // ============================================================================
@@ -1694,7 +1727,7 @@ __device__ __forceinline__ DeepGemm_params batch_params_for_block(
     return batch_params;
 }
 
-template<typename Element_O>
+template<bool kTailTile, typename Element_O>
 __device__ void compute_fp8_gemm_hipc(const DeepGemm_params& params) {
     using Element = GemmTraitsPC::Element;
 
@@ -1710,10 +1743,10 @@ __device__ void compute_fp8_gemm_hipc(const DeepGemm_params& params) {
         batch_params_for_block<Element_O>(params);
 
     if (warp_id < GemmTraitsPC::kNProducerWaves) {
-        producer_body(batch_params, warp_id, a_lds_all, by, bx, lane_id);
+        producer_body<kTailTile>(batch_params, warp_id, a_lds_all, by, bx, lane_id);
     } else {
         int consumer_id = warp_id - GemmTraitsPC::kNProducerWaves;
-        consumer_body<Element_O>(batch_params, consumer_id, a_lds_all, by, bx, lane_id);
+        consumer_body<kTailTile, Element_O>(batch_params, consumer_id, a_lds_all, by, bx, lane_id);
     }
 }
 
@@ -1725,19 +1758,25 @@ __device__ void compute_fp8_gemm_hipc(const DeepGemm_params& params) {
 // the 256 cap but well past the occupancy break-even → without a max the
 // compiler spills every extra buffer. 768-thread WG already burns 12 wave
 // slots per CU, so more waves/EU is not achievable anyway.
-template<typename Element_O>
+// Two instantiations per output dtype: kTailTile=false is the plain kernel
+// (no B K-tail masking, byte-identical codegen to the original); kTailTile=true
+// additionally masks complete B chunks past logical K.
+template<bool kTailTile, typename Element_O>
 __global__ void
 __attribute__((amdgpu_flat_work_group_size(1, GemmTraitsPC::kNThreads),
                amdgpu_waves_per_eu(1, 1)))
 fp8_gemm_hipc_kernel_gfx938(DeepGemm_params params) {
-    compute_fp8_gemm_hipc<Element_O>(params);
+    compute_fp8_gemm_hipc<kTailTile, Element_O>(params);
 }
 
-// One kernel per output dtype; scaled vs identity is a runtime branch (see
-// run_fp8_gemm_hipc_impl).
-template __global__ void fp8_gemm_hipc_kernel_gfx938<bhalf_t>(DeepGemm_params);
-template __global__ void fp8_gemm_hipc_kernel_gfx938<half_t>(DeepGemm_params);
-template __global__ void fp8_gemm_hipc_kernel_gfx938<float>(DeepGemm_params);
+// One kernel per (tail, output dtype); scaled vs identity is a runtime branch
+// (see run_fp8_gemm_hipc_impl).
+template __global__ void fp8_gemm_hipc_kernel_gfx938<false, bhalf_t>(DeepGemm_params);
+template __global__ void fp8_gemm_hipc_kernel_gfx938<false, half_t>(DeepGemm_params);
+template __global__ void fp8_gemm_hipc_kernel_gfx938<false, float>(DeepGemm_params);
+template __global__ void fp8_gemm_hipc_kernel_gfx938<true, bhalf_t>(DeepGemm_params);
+template __global__ void fp8_gemm_hipc_kernel_gfx938<true, half_t>(DeepGemm_params);
+template __global__ void fp8_gemm_hipc_kernel_gfx938<true, float>(DeepGemm_params);
 
 template<typename Element_O>
 void run_fp8_gemm_hipc_impl(DeepGemm_params& params, hipStream_t stream) {
@@ -1746,12 +1785,19 @@ void run_fp8_gemm_hipc_impl(DeepGemm_params& params, hipStream_t stream) {
     // Grid z = batch: each blockIdx.z picks one batch's base pointers via
     // batch_params_for_block.
     const int batch_count = params.batch > 0 ? params.batch : 1;
-    dim3 grid(block_x, block_y, batch_count);
     dim3 block(GemmTraitsPC::kNThreads);
     // Scaled vs identity is a runtime branch on params.scale_a_ptr — uniform
     // across the WG, so barrier counts match. No per-scale kernel copies.
-    fp8_gemm_hipc_kernel_gfx938<Element_O>
-        <<<grid, block, GemmTraitsPC::kSmemSize, stream>>>(params);
+    //
+    if (params.k % 128 != 0) {
+        fp8_gemm_hipc_kernel_gfx938<true, Element_O>
+            <<<dim3(block_x, block_y, batch_count), block,
+                GemmTraitsPC::kSmemSize, stream>>>(params);
+    } else {
+        fp8_gemm_hipc_kernel_gfx938<false, Element_O>
+            <<<dim3(block_x, block_y, batch_count), block,
+                GemmTraitsPC::kSmemSize, stream>>>(params);
+    }
 }
 
 // Public entry point. See fp8_gemm_hipc.h for API semantics and the mat_a↔mat_b /
@@ -1772,15 +1818,17 @@ void run_fp8_gemm_hipc(
                     const int64_t n,
                     const int64_t k,
                     const int64_t batch,
-                    const std::string& /*transpose_flag*/,
+                    const std::string& transpose_flag,
                     const torch::Tensor& alpha,
                     const torch::Tensor& beta,
-                    const std::optional<torch::Tensor>& /*bias*/) {
+                    const std::optional<torch::Tensor>& bias) {
     // Roles after the swap: mat_b = true A (n rows, → p.m); mat_a = true B
     // (m rows, → p.n); output = [n, m]. scale_b scales true A (n per batch),
     // scale_a scales true B (m per batch).
     TORCH_CHECK(batch >= 1 && batch <= 65535,
                 "batch must be in [1, 65535] (gridDim.z limit), got ", batch);
+    TORCH_CHECK(k % 16 == 0,
+                "fp8_gemm_hipc requires K to be divisible by 16, got K=", k);
 
     auto check_tile = [&](const torch::Tensor& t, const char* name,
                           int64_t rows, int64_t cols) {
@@ -1898,7 +1946,9 @@ void fp8_gemm_hipc(
                     const torch::Tensor& alpha,
                     const torch::Tensor& beta,
                     const std::optional<torch::Tensor>& bias) {
-    ::run_fp8_gemm_hipc(mat_a, mat_b, scale_a, scale_b, output,
+    ::gfx938::run_fp8_gemm_hipc(mat_a, mat_b, scale_a, scale_b, output,
                         m, n, k, batch, transpose_flag, alpha, beta, bias);
 }
 }  // namespace deepgemm
+
+}  // namespace gfx938

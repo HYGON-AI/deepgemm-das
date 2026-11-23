@@ -6,18 +6,12 @@ from .group_gemm_weight_pack import (
     I8_LAYOUT_MODE_MASKED_LAYOUT_ASM,
     I8_LAYOUT_MODE_W6_HIPC,
     _get_current_gfx_arch,
-    _is_gfx936_contiguous_arch,
-    _resolve_i8_layout_mode_from_config,
     _resolve_shuffle_unique,
-    _strip_i8_layout_mode_from_config,
 )
+from .configs.w8a8_contiguous import select_w8a8_contiguous_mode
 from .configs.contiguous import (
-    DEFAULT_FP8_CONTIG_CONFIG,
-    get_m_grouped_fp8_contiguous_config,
+    DEFAULT_W4A8_CONTIG_CONFIG,
     resolve_contiguous_hipc_config,
-    resolve_fp8_contiguous_block_m,
-    resolve_fp8_contiguous_n_loop_num,
-    select_fp8_contig_hipc_config,
 )
 
 
@@ -64,9 +58,16 @@ def m_grouped_w4a8_gemm_nt_contiguous_hipc(
     m_indices: torch.Tensor,
     config: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
+    """Run contiguous W4A8 GEMM with K-packed HIPC weights and B scales /16.
+
+    Mode 1006 is the default and requires expert segments padded to 128
+    rows, with a valid prefix followed by m_indices=-1 padding. It selects
+    16/32/64/128 rows per tile on the device and supports BF16 output.
+    Pass config={"MODE": 1002} to select the original implementation.
+    """
     input, a_scale = a
     b_qweight, b_scale = b
-    mode = int(config.get("MODE", 1002)) if config is not None else 1002
+    mode = int((config or {}).get("MODE", DEFAULT_W4A8_CONTIG_CONFIG["MODE"]))
     a_scale = _normalize_contiguous_w4a8_a_scale(a_scale)
     b_scale = _normalize_contiguous_w4a8_b_scale(b_scale)
     if input.dim() != 2:
@@ -85,6 +86,7 @@ def m_grouped_w4a8_gemm_nt_contiguous_hipc(
     if m_indices.dtype != torch.int32:
         m_indices = m_indices.to(torch.int32)
     if PRINT_SIZE_ENABLED:
+        block_m, block_n, n_loop_num = (128, 512, 1) if mode == 1006 else (64, 128, 4)
         print_contiguous_size(
             "m_grouped_w4a8_gemm_nt_contiguous_hipc",
             input,
@@ -94,9 +96,9 @@ def m_grouped_w4a8_gemm_nt_contiguous_hipc(
             b_scale,
             m_indices,
             mode,
-            block_m=64,
-            block_n=128,
-            n_loop_num=4,
+            block_m=block_m,
+            block_n=block_n,
+            n_loop_num=n_loop_num,
         )
     return op.m_grouped_marlin_w4a8_gemm_nt_contiguous_hipc(
         input,
@@ -155,7 +157,7 @@ def _m_grouped_i8_gemm_nt_contiguous_gfx938_impl(
             block_n=block_n,
             n_loop_num=n_loop_num,
         )
-    torch.ops.deep_gemm.m_grouped_i8_gemm_nt_contiguous(
+    op.m_grouped_i8_gemm_nt_contiguous(
         input,
         b_qweight,
         output,
@@ -169,6 +171,89 @@ def _m_grouped_i8_gemm_nt_contiguous_gfx938_impl(
     return output
 
 
+def m_grouped_int8_gemm_nt_contiguous_wasp_pair32(
+    a: tuple[torch.Tensor, torch.Tensor],
+    b: tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+    m_indices: torch.Tensor,
+    config: Optional[Dict[str, Any]] = None,
+) -> torch.Tensor:
+    input, a_scale = a
+    b_qweight, b_scale = b
+    b_scale = _normalize_contiguous_i8_b_scale(b_scale)
+
+    if config is not None and 'MODE' in config:
+        mode = config['MODE']
+    else:
+        mode = 1000
+
+    op.m_grouped_int8_gemm_nt_contiguous_wasp_pair32(
+        input,
+        b_qweight,
+        output,
+        a_scale.contiguous(),
+        b_scale.contiguous(),
+        m_indices.contiguous(),
+        1000
+    )
+    return output
+
+
+def m_grouped_fp8_gemm_nt_contiguous_wasp_pair32(
+    a: tuple[torch.Tensor, torch.Tensor],
+    b: tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+    m_indices: torch.Tensor,
+    config: Optional[Dict[str, Any]] = None,
+) -> torch.Tensor:
+    input, a_scale = a
+    b_qweight, b_scale = b
+    op.m_grouped_fp8_gemm_nt_contiguous_wasp_pair32(
+        input, b_qweight, output, a_scale.contiguous(), b_scale.contiguous(),
+        m_indices.contiguous(), config.get("MODE", 1000) if config else 1000,
+    )
+    return output
+
+
+def m_grouped_fp8_gemm_nt_contiguous_wasp_pair32_v2(
+    a: tuple[torch.Tensor, torch.Tensor],
+    b: tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+    m_indices: torch.Tensor,
+    config: Optional[Dict[str, Any]] = None,
+) -> torch.Tensor:
+    """Run a persistent gfx938 pair32_v2 FP8 kernel.
+
+    With no explicit MODE, select from JSON tables using total M.
+    MODE 1000: BM256/BN256; 1001: BM128/BN256;
+    1002: BM128/BN384. Expert segments must align to the selected BM.
+    """
+    input, a_scale = a
+    b_qweight, b_scale = b
+
+    if config is not None and 'MODE' in config:
+        mode = config['MODE']
+    else:
+        mode = select_w8a8_contiguous_mode(
+            input.size(0), output.size(1), input.size(1),
+            experts=b_qweight.size(0), device=input.device,
+        )
+
+    op.m_grouped_fp8_gemm_nt_contiguous_wasp_pair32_v2(
+        input,
+        b_qweight,
+        output,
+        a_scale.contiguous(),
+        b_scale.contiguous(),
+        m_indices.contiguous(),
+        mode
+    )
+    return output
+
+
+# Preserve the requested abbreviated spelling as an alias.
+m_grouped_fp8_gemm_nt_contigous_pair32_v2 = m_grouped_fp8_gemm_nt_contiguous_wasp_pair32_v2
+
 def m_grouped_i8_gemm_nt_contiguous(
     a: tuple[torch.Tensor, torch.Tensor],
     b: tuple[torch.Tensor, torch.Tensor],
@@ -179,48 +264,13 @@ def m_grouped_i8_gemm_nt_contiguous(
     shuffle_unique: int = 1,
 ) -> torch.Tensor:
     arch = _get_current_gfx_arch()
-    shuffle_unique = _resolve_shuffle_unique(shuffle_unique)
-    if _is_gfx936_contiguous_arch(arch):
-        b_qweight = b[0]
-        if shuffle_unique == 1:
-            mode = _resolve_i8_layout_mode_from_config(config)
-            if mode == I8_LAYOUT_MODE_W6_HIPC:
-                if b_qweight.dim() != 6:
-                    raise ValueError(
-                        "gfx936 mode=1 expects W6 packed weight "
-                        "[E,K/64,N/16,4,16,16]"
-                    )
-                hipc_config = _strip_i8_layout_mode_from_config(config)
-                return _m_grouped_i8_gemm_nt_contiguous_gfx936_hipc_impl(
-                    a, b, output, m_indices, hipc_config
-                )
-            if mode == I8_LAYOUT_MODE_MASKED_LAYOUT_ASM:
-                if arch != "gfx936":
-                    raise AssertionError(
-                        "m_grouped_i8_gemm_nt_contiguous mode=2 is only implemented for gfx936"
-                    )
-                return _m_grouped_i8_gemm_nt_contiguous_gfx936_masked_layout_impl(
-                    a, b, output, m_indices
-                )
-        if b_qweight.dim() == 3:
-            return _m_grouped_i8_gemm_nt_contiguous_gfx936_asm_impl(a, b, output, m_indices, config)
-        if b_qweight.dim() == 6:
-            if arch == "gfx92a":
-                raise AssertionError(
-                    f"m_grouped_i8_gemm_nt_contiguous does not support shuffle_unique={shuffle_unique} on gfx92a"
-                )
-            return _m_grouped_i8_gemm_nt_contiguous_gfx936_asm_impl(a, b, output, m_indices, config)
-        raise ValueError(
-            "m_grouped_i8_gemm_nt_contiguous expects packed weight "
-            "[E,N/16,K*16] or [E,K/64,N/16,4,16,16]"
-        )
-    if arch == "gfx938":
-        return _m_grouped_i8_gemm_nt_contiguous_gfx938_impl(a, b, output, m_indices, config)
+
+    return m_grouped_int8_gemm_nt_contiguous_wasp_pair32(a, b, output, m_indices, config)
+
     raise RuntimeError(
         f"m_grouped_i8_gemm_nt_contiguous does not support GPU arch {arch}; "
         "expected gfx936/gfx92a/gfx928 or gfx938"
     )
-
 
 def _m_grouped_i8_gemm_nt_contiguous_gfx936_asm_impl(
     a: tuple[torch.Tensor, torch.Tensor],
@@ -294,7 +344,7 @@ def _m_grouped_i8_gemm_nt_contiguous_gfx936_hipc_impl(
         )
     if m_indices.dtype != torch.int32:
         m_indices = m_indices.to(torch.int32)
-    torch.ops.deep_gemm.m_grouped_w8a8_gemm_nt_contiguous_gfx936(
+    op.m_grouped_w8a8_gemm_nt_contiguous_gfx936(
         input,
         b_qweight,
         output,
@@ -334,96 +384,15 @@ def m_grouped_fp8_gemm_nt_contiguous(
     m_indices: torch.Tensor,
     config: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
-    input, a_scale = a
-    b_qweight, b_scale = b
-    if config is None:
-        block_m, block_n, n_loop_num = select_fp8_contig_hipc_config(
-            int(input.size(0)),
-            size_n=int(output.size(-1)),
-            size_k=int(input.size(-1)),
-            num_groups=int(b_qweight.size(0)),
+    if _get_current_gfx_arch() == "gfx938":
+        return m_grouped_fp8_gemm_nt_contiguous_wasp_pair32_v2(
+            a, b, output, m_indices, config
         )
-    else:
-        block_m = int(config.get("BLOCK_M", config.get("MODE", 128)))
-        block_n = int(config.get("BLOCK_N", 256))
-        n_loop_num = int(config.get("N_LOOP_NUM", 4))
-    if m_indices.dtype != torch.int32:
-        m_indices = m_indices.to(torch.int32)
-    if PRINT_SIZE_ENABLED:
-        print_contiguous_size(
-            "m_grouped_fp8_gemm_nt_contiguous",
-            input,
-            b_qweight,
-            output,
-            a_scale,
-            b_scale,
-            m_indices,
-            block_m,
-            block_m=block_m,
-            block_n=block_n,
-            n_loop_num=n_loop_num,
-        )
-    torch.ops.deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-        input,
-        b_qweight,
-        output,
-        a_scale.contiguous(),
-        b_scale.contiguous(),
-        m_indices.contiguous(),
-        block_m,
-        block_n,
-        n_loop_num,
-    )
-    return output
 
-
-def m_grouped_fp8_gemm_nt_contiguous_tensor_wise(
-    a: tuple[torch.Tensor, torch.Tensor],
-    b: tuple[torch.Tensor, torch.Tensor],
-    output: torch.Tensor,
-    m_indices: torch.Tensor,
-    config: Optional[Dict[str, Any]] = None,
-) -> torch.Tensor:
-    input, a_scale = a
-    b_qweight, b_scale = b
-    size_m = int(input.size(0))
-    size_n = int(output.size(-1))
-    if config is None:
-        config = get_m_grouped_fp8_contiguous_config(size_m, size_n)
-    mode = resolve_fp8_contiguous_block_m(size_m, config.get("MODE", DEFAULT_FP8_CONTIG_CONFIG["MODE"]))
-    requested_n_loop = int(config.get("N_LOOP_NUM", DEFAULT_FP8_CONTIG_CONFIG["N_LOOP_NUM"]))
-    n_loop_num = resolve_fp8_contiguous_n_loop_num(size_n, requested_n_loop)
-    if m_indices.dtype != torch.int32:
-        m_indices = m_indices.to(torch.int32)
-    if not (b_scale.dim() == 1 or (b_scale.dim() == 2 and b_scale.size(1) == 1)):
-        raise ValueError(
-            "tensor-wise contiguous B scale must have shape [E] or [E, 1], "
-            f"got {tuple(b_scale.shape)}"
-        )
-    if PRINT_SIZE_ENABLED:
-        print_contiguous_size(
-            "m_grouped_fp8_gemm_nt_contiguous_marlin_tensor_wise",
-            input,
-            b_qweight,
-            output,
-            a_scale,
-            b_scale,
-            m_indices,
-            mode,
-            block_m=mode,
-            n_loop_num=n_loop_num,
-        )
-    torch.ops.deep_gemm.m_grouped_fp8_gemm_nt_contiguous_marlin_tensor_wise(
-        input,
-        b_qweight,
-        output,
-        a_scale,
-        b_scale.contiguous(),
-        m_indices,
-        mode,
-        n_loop_num,
+    return m_grouped_fp8_gemm_nt_contiguous_wasp_pair32(
+        a, b, output, m_indices, config
     )
-    return output
+
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +456,7 @@ def m_grouped_wfp4a16_gemm_nt_contiguous(
             block_n=128,
             n_loop_num=1,
         )
-    torch.ops.deep_gemm.m_grouped_wfp4a16_gemm_nt_contiguous(
+    op.m_grouped_wfp4a16_gemm_nt_contiguous(
         a,
         matrix_b,
         output,

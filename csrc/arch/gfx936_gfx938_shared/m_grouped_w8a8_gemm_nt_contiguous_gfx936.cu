@@ -859,12 +859,3 @@ torch::Tensor i8_contig_ll(torch::Tensor input,
 }
 
 }  // namespace i8_contig_ll_v92
-
-TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
-  m.def("m_grouped_w8a8_gemm_nt_contiguous_gfx936("
-        "Tensor input, Tensor b_qweight, Tensor output, Tensor a_scale, "
-        "Tensor b_scale, Tensor m_indices, int block_m, int block_n, "
-        "int n_loop_num) -> Tensor");
-  m.impl("m_grouped_w8a8_gemm_nt_contiguous_gfx936", torch::kCUDA,
-         &i8_contig_ll_v92::i8_contig_ll);
-}

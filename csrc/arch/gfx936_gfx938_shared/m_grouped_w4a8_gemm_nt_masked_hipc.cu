@@ -7,10 +7,17 @@
 #include <hip/hip_hcc.h>
 #include <cstdlib>
 #include <numeric>
+#include <tuple>
+#include <utility>
+#include <type_traits>
 #include <vector>
 
 #include "m_grouped_gemm_nt_masked.h"
 #include "hipc_w4a8/w4a8_intrinsics.h"
+
+#include "m_grouped_w4a8_gemm_nt_masked_pair32/bm128_bn256_bk128.inc.cuh"
+
+namespace gfx936_gfx938_shared {
 
 using half_t = __half;
 using bhalf_t = __hip_bfloat16;
@@ -41,7 +48,10 @@ struct GemmParams_w4a8 {
                uint32_t stride_bse,
                uint32_t stride_bsn, 
                uint32_t stride_bsk,
-               uint32_t blocks_per_expert
+               uint32_t blocks_per_expert,
+               int persistent_multiplier = 0,
+               bool enable_overlap = false,
+               int32_t* signal = nullptr
             )
         : ptr_A(ptr_A),
           ptr_B0(ptr_B0),
@@ -58,7 +68,10 @@ struct GemmParams_w4a8 {
           stride_bse(stride_bse),
           stride_bsn(stride_bsn),
           stride_bsk(stride_bsk),
-          blocks_per_expert(blocks_per_expert)
+          blocks_per_expert(blocks_per_expert),
+          persistent_multiplier(persistent_multiplier),
+          enable_overlap(enable_overlap),
+          signal(signal)
          {}
 
     const T* ptr_A;
@@ -77,6 +90,9 @@ struct GemmParams_w4a8 {
     uint32_t stride_bsn;
     uint32_t stride_bsk;
     uint32_t blocks_per_expert;
+    int persistent_multiplier;
+    bool enable_overlap;
+    int32_t* signal;
 };
 
 template<bool Is_store_A, 
@@ -96,7 +112,8 @@ template<bool Is_store_A,
     typename Element, 
     typename ElementAccum = int32_t,
     int N_LOOP_NUM = 4,
-    bool ABC_ORDER = false>
+    bool ABC_ORDER = false,
+    bool LDS_ONLY_REUSE = false>
 __forceinline__ __device__ void  gemm_nt_marlin_prefill_w4a8(
     const Element* input_ptr, 
     const Element* weight_ptr, 
@@ -105,6 +122,7 @@ __forceinline__ __device__ void  gemm_nt_marlin_prefill_w4a8(
     float* input_scale_ptr,
     float* weight_scale_ptr,
     int max_n_len_offset, 
+    int valid_m_for_load,
     union_vec_opt<Element,WARP_K/4> A_reg[][STAGE],
     union_vec_opt<Element,WARP_K/4> B_reg[][2][STAGE],
     intx4 C_reg[][(WARP_M/16)*(WARP_N/16)],
@@ -142,7 +160,6 @@ __forceinline__ __device__ void  gemm_nt_marlin_prefill_w4a8(
 
     const int stage_offset = warp_k_num * WARP_K;
     const int stage_offset_b = warp_k_num * (WARP_K / 2 ) * size_n;
-    const int lds_stage_offset = WARP_M * WARP_K;
 
     int g_row_A[WARP_M / MFMA_M];
     int g_row_B[WARP_N / MFMA_N];
@@ -168,48 +185,125 @@ __forceinline__ __device__ void  gemm_nt_marlin_prefill_w4a8(
            
 
             int s_offset = bidx * BLOCK_M + m_tile * MFMA_M + A_index*4;
-            int row = std::min(s_offset + col_id, max_n_len_offset - 1);
+            int row = std::min(s_offset + col_id, valid_m_for_load - 1);
             g_row_A[m_tile] = (expert_id * max_n_len_offset + row) * size_k + row_id * 4;
             
 
     }
 
+
+#if defined(__gfx938__)
+    constexpr bool matrix_a = (WARP_M == 64 || WARP_M == 128) && WARP_NUM == 4 &&
+        BLOCK_K == 64 && WARP_K == 64 && (N_LOOP_NUM == 2 || N_LOOP_NUM == 4);
+#else
+    constexpr bool matrix_a = false;
+#endif
+    constexpr bool cache_a_descriptor = matrix_a && WARP_M == 64 && WARP_N == 32 && N_LOOP_NUM == 2 && STAGE == 2;
+    using ADesc = unsigned __attribute__((ext_vector_type(4)));
+    ADesc a_descriptor[DIVIDE(WARP_M, 64)];
+    int a_lds_offset[DIVIDE(WARP_M, 64)];
+    if constexpr (cache_a_descriptor) {
+        #pragma unroll
+        for (int tile = 0; tile < WARP_M / 64; ++tile) {
+            const int first_row = bidx * BLOCK_M + tile * 64 + (warp_id & 1) * 32;
+            const int rows = std::max(0, std::min(32, valid_m_for_load - first_row));
+            const uint64_t address = reinterpret_cast<uint64_t>(input_ptr +
+                (expert_id * max_n_len_offset + std::min(first_row, valid_m_for_load - 1)) * size_k +
+                (warp_id / 2) * 64);
+            a_descriptor[tile] = ADesc{
+                static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<unsigned>(address))),
+                static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<unsigned>(address >> 32))),
+                static_cast<unsigned>(__builtin_amdgcn_readfirstlane(size_k)),
+                static_cast<unsigned>(__builtin_amdgcn_readfirstlane((32 - rows) << 8))};
+            a_lds_offset[tile] = __builtin_amdgcn_readfirstlane(static_cast<int>(
+                reinterpret_cast<uintptr_t>(A_lds) + tile * 4096 + (warp_id & 1) * 2048 +
+                (warp_id / 2) * WARP_M * 64));
+        }
+    }
+    auto load_a = [&](int next_k) {
+        if constexpr (cache_a_descriptor) {
+            #pragma unroll
+            for (int tile = 0; tile < WARP_M / 64; ++tile) {
+                ADesc descriptor = a_descriptor[tile];
+                const uint64_t address = (static_cast<uint64_t>(descriptor[1]) << 32 | descriptor[0]) + next_k;
+                descriptor[0] = static_cast<unsigned>(address);
+                descriptor[1] = static_cast<unsigned>(address >> 32);
+                asm volatile("s_nop 4\n\t"
+                             "matrix_load_64x32_b8 %0, %1, moffset:0 lds\n\t"
+                             : : "s"(descriptor), "s"(a_lds_offset[tile]) : "memory");
+            }
+        } else if constexpr (matrix_a) {
+            using U4 = unsigned __attribute__((ext_vector_type(4)));
+            #pragma unroll
+            for (int tile=0; tile<WARP_M/64; ++tile) {
+                const int first_row = bidx * BLOCK_M + tile * 64 + (warp_id & 1) * 32;
+                const int rows = std::max(0, std::min(32, valid_m_for_load - first_row));
+                U4 descriptor = {};
+                const uint64_t address = reinterpret_cast<uint64_t>(input_ptr +
+                    (expert_id * max_n_len_offset + std::min(first_row, valid_m_for_load - 1)) *
+                        size_k + next_k + (warp_id / 2) * 64);
+                descriptor[0] = static_cast<uint32_t>(address);
+                descriptor[1] = static_cast<uint32_t>(address >> 32);
+                descriptor[2] = size_k;
+                descriptor[3] = (32 - rows) << 8;
+                const U4 uniform = {
+                    static_cast<unsigned>(__builtin_amdgcn_readfirstlane(descriptor[0])),
+                    static_cast<unsigned>(__builtin_amdgcn_readfirstlane(descriptor[1])),
+                    static_cast<unsigned>(__builtin_amdgcn_readfirstlane(descriptor[2])),
+                    static_cast<unsigned>(__builtin_amdgcn_readfirstlane(descriptor[3]))};
+                const int offset = __builtin_amdgcn_readfirstlane(static_cast<int>(
+                    (uintptr_t)A_lds + tile * 4096 + (warp_id & 1) * 2048 + (warp_id / 2) * WARP_M * 64));
+                // VMEM completion is handled by the existing A/B pipeline waits.
+                asm volatile("s_nop 4\n\t"
+                             "matrix_load_64x32_b8 %0, %1, moffset:0 lds\n\t"
+                             : : "s"(uniform), "s"(offset) : "memory");
+            }
+
+        } else {
+            #pragma unroll
+            for (int stage = 0; stage < 2; ++stage) {
+                #pragma unroll
+                for (int mt = 0; mt < WARP_M / MFMA_M; ++mt) {
+                    inline_buffer_load_dword_lds(A_lds, g_input,
+                        (mt * 16 * WARP_K + A_index * 4 * WARP_K + stage * WARP_M * WARP_K) / 4,
+                        (next_k + warp_k_id * WARP_K + stage * stage_offset) / 4, g_row_A[mt] / 4);
+                }
+            }
+        }
+    };
+    constexpr bool prefetch_b_next = cache_a_descriptor;
+    union {
+        vec<int, 4> v;
+        uint32_t i[4];
+    } weight_reg_tmp[ WARP_N / 32][2][STAGE];
+    auto prefetch_first_b = [&](int next_k) {
+        #pragma unroll
+        for (int stage = 0; stage < 2; ++stage) {
+            #pragma unroll
+            for (int nt = 0; nt < WARP_N / 32; ++nt) {
+                #pragma unroll
+                for (int kt = 0; kt < WARP_K / READ_K; ++kt) {
+                    buffer_load_reg_dwordx4_w4a8(weight_ptr, weight_reg_tmp[nt][0][stage].v,
+                        warp_k_id * (WARP_K / 2) * size_n + next_k / 2 * size_n +
+                        stage * stage_offset_b + kt * 32 * size_n, g_row_B[nt]);
+                }
+            }
+        }
+    };
     int kloop = 0;
-    int k_start = warp_k_id * (WARP_K ) + kloop * (128);
-    
-    int i =0;
+    int i = 0;
+    load_a(0);
+    if constexpr (prefetch_b_next) prefetch_first_b(0);
 
-    #pragma unroll
-    for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
-        #pragma unroll
-        for(int k_tile = 0; k_tile < WARP_K / READ_K; k_tile++){ 
+auto compute_kloop = [&](auto prefetch_next_constant) {
+    constexpr bool PREFETCH_NEXT = decltype(prefetch_next_constant)::value;
 
-                inline_buffer_load_dword_lds( A_lds,  g_input, (m_tile * (16) * WARP_K + A_index * 4 * WARP_K ) / 4 +  (0) * (WARP_M / 16) * (16) * WARP_K / 4  ,  ( k_tile * READ_K + k_start) / 4 , (g_row_A[m_tile] )/4);
-            
-
-        }
+    if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
+    // The first B wait also completes the older A loads before reading LDS.
+    if constexpr (STAGE != 2) {
+        vmcnt_wait(0);
     }
-    
-
-    i = 1;
-
-    
-    k_start += stage_offset;
-
-    #pragma unroll
-    for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
-        #pragma unroll
-        for(int k_tile = 0; k_tile < WARP_K / READ_K; k_tile++){ 
-
-                inline_buffer_load_dword_lds(  A_lds,  g_input, (m_tile * (16) * WARP_K + A_index * 4 * WARP_K) / 4 +  (1) * (WARP_M / 16) * (16) * WARP_K / 4  ,  ( k_tile * READ_K + k_start) / 4, (g_row_A[m_tile] )/4);
-
-        }
-    }
-
-for(kloop  ;kloop < k_loop_count ;kloop++){
-
-    __builtin_hcu_sched_barrier(0);
-    vmcnt_wait(0);
 
     int k_start_b = warp_k_id * (WARP_K / 2 ) * size_n  + kloop * (128 / 2) * size_n;
     
@@ -233,10 +327,7 @@ for(kloop  ;kloop < k_loop_count ;kloop++){
     
 
     
-    union {
-        vec<int, 4> v;
-        uint32_t i[4];
-    } weight_reg_tmp[ WARP_N / 32][2][STAGE];
+
     
 
 if constexpr (STAGE == 2){
@@ -247,7 +338,9 @@ int i =0;
 int stage_b_flag =0;
 int n_loop =0;
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!prefetch_b_next) {
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 #pragma unroll
 for(int n_tile = 0; n_tile < WARP_N / 32; n_tile++){
 
@@ -261,14 +354,16 @@ for(int n_tile = 0; n_tile < WARP_N / 32; n_tile++){
 
 }
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
 i = 1;
 
 k_start_b += stage_offset_b;
 
       
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
 #pragma unroll
 for(int n_tile = 0; n_tile < WARP_N / 32; n_tile++){
@@ -282,8 +377,10 @@ for(int n_tile = 0; n_tile < WARP_N / 32; n_tile++){
         }
 
 }
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
+}
 vmcnt_wait(2 *( WARP_N / 32 ) );
 
 	    #pragma unroll
@@ -292,8 +389,9 @@ vmcnt_wait(2 *( WARP_N / 32 ) );
 	        for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
 	            #pragma unroll
             for(int k_tile = 0; k_tile < WARP_K / READ_K; k_tile++){ 
+                // MLS swizzles each pair of rows across the two 32-byte K halves.
                 int s_index = m_tile * (16) * 64 + + (i) * WARP_M / 16 * (16) * WARP_K;
-                A_reg[m_tile][i].int4_array[k_tile] = *( vec<Element, 16> *) (&A_lds[ s_index + row_id * 64 + col_id * 16      ]);
+                A_reg[m_tile][i].int4_array[k_tile] = *( vec<Element, 16> *) (&A_lds[ s_index + row_id * 64 + (col_id * 16 ^ (matrix_a ? ((row_id & 2) << 4) : 0)) ]);
 
             }
 	        } 
@@ -309,7 +407,8 @@ stage_b_flag ^= 1;
 cur_weight_ptr  +=   BLOCK_N * 32;
 int i =0;
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
 #pragma unroll
 for(int n_tile = 0; n_tile < WARP_N / 32; n_tile++){
@@ -324,13 +423,15 @@ for(int n_tile = 0; n_tile < WARP_N / 32; n_tile++){
         }
 
 }
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
 i = 1;
 
 k_start_b += stage_offset_b;
         
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 #pragma unroll
 for(int n_tile = 0; n_tile < WARP_N / 32; n_tile++){
 
@@ -343,11 +444,13 @@ for(int n_tile = 0; n_tile < WARP_N / 32; n_tile++){
         }
 
 }
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
    
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 vmcnt_only_wait( 3* ( WARP_N / 32 ));
 
     
@@ -355,9 +458,11 @@ n_loop--;
 i = 0;
 stage_b_flag ^= 1;
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
     
 
@@ -383,7 +488,8 @@ __builtin_hcu_sched_barrier(0);
         }
     }
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
 #pragma unroll 
 for(int m_tile = 0; m_tile <  WARP_M / MFMA_M; m_tile++){
@@ -410,13 +516,15 @@ for(int m_tile = 0; m_tile <  WARP_M / MFMA_M; m_tile++){
     }
 }
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
 vmcnt_only_wait( 2* ( WARP_N / 32 ));
 
 i = 1;
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
     
 
@@ -444,7 +552,8 @@ __builtin_hcu_sched_barrier(0);
         }
     }
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
 #pragma unroll
 for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
@@ -472,7 +581,8 @@ for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
 }
 
     
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 stage_b_flag ^= 1;
 n_loop ++;
 
@@ -481,54 +591,28 @@ k_start_b = warp_k_id * (WARP_K / 2 ) * size_n  + kloop * (WARP_K * 2 / 2) * siz
 }
 
     n_loop--;
-    wave_barrier();
-    if(kloop <  k_loop_count - 1 ) {
-
-        kloop++;
-        k_start = warp_k_id * (WARP_K ) + kloop * (128);
-
-        i =0;
-
-        #pragma unroll
-        for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
-            #pragma unroll
-            for(int k_tile = 0; k_tile < WARP_K / READ_K; k_tile++){ 
-
-                    inline_buffer_load_dword_lds( A_lds,  g_input, (m_tile * (16) * WARP_K + A_index * 4 * WARP_K ) / 4 +  (0) * (WARP_M / 16) * (16) * WARP_K / 4  ,  ( k_tile * READ_K + k_start) / 4 , (g_row_A[m_tile] )/4);
-                    
-
-            }
-        }
-        
-
-        i = 1;
-
-        
-        k_start += stage_offset;
-
-        #pragma unroll
-        for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
-            #pragma unroll
-            for(int k_tile = 0; k_tile < WARP_K / READ_K; k_tile++){ 
-
-                    inline_buffer_load_dword_lds(  A_lds,  g_input, (m_tile * (16) * WARP_K + A_index * 4 * WARP_K) / 4 +  (1) * (WARP_M / 16) * (16) * WARP_K / 4  ,  ( k_tile * READ_K + k_start) / 4, (g_row_A[m_tile] )/4);
-
-            }
-        }
-        kloop --;
+    // Finish shared A reads while register-only B loads continue.
+    if constexpr (cache_a_descriptor && LDS_ONLY_REUSE) {
+        __builtin_hcu_sched_barrier(0);
+        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier\n\t" ::: "memory");
+        __builtin_hcu_sched_barrier(0);
+    } else {
+        __syncthreads();
     }
-    
-    
+    if constexpr (PREFETCH_NEXT) {
+        load_a((kloop + 1) * 128);
+        if constexpr (prefetch_b_next) prefetch_first_b((kloop + 1) * 128);
+    }
+    vmcnt_only_wait( (prefetch_b_next && PREFETCH_NEXT ? 2 : 0) + ( WARP_N / 32 ) + (matrix_a ? WARP_M / 64 : 2 * (WARP_M / MFMA_M) * (WARP_K / READ_K)) );
 
-    vmcnt_only_wait(  ( WARP_N / 32 ) + (2 * (WARP_M / MFMA_M) * (WARP_K / READ_K)) );
-
-if(kloop == k_loop_count - 1 ){
+if constexpr (!PREFETCH_NEXT) {
     vmcnt_wait(  ( WARP_N / 32 ) );
 }
 
 i = 0;
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
     
 
@@ -555,7 +639,8 @@ __builtin_hcu_sched_barrier(0);
         }
     }
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
 #pragma unroll
 for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
@@ -581,18 +666,21 @@ for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
     }
 }
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
-    vmcnt_wait(2 * (WARP_M / MFMA_M) * (WARP_K / READ_K));
+    // Only register B operands are consumed here; LDS reuse is fenced above.
+    vmcnt_only_wait((prefetch_b_next && PREFETCH_NEXT ? 2 : 0) + (matrix_a ? WARP_M / 64 : 2 * (WARP_M / MFMA_M) * (WARP_K / READ_K)));
 
-    if(kloop == k_loop_count - 1 ){
+    if constexpr (!PREFETCH_NEXT) {
         vmcnt_wait(  0 );
     }
     
 
 i = 1;
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
     
 
@@ -622,7 +710,8 @@ __builtin_hcu_sched_barrier(0);
 
   
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
 #pragma unroll
 for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
@@ -647,15 +736,24 @@ for(int m_tile = 0; m_tile < WARP_M / MFMA_M; m_tile++){
         }
     }
 }
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
-__builtin_hcu_sched_barrier(0);
+if constexpr (!(matrix_a && WARP_M == 128 && std::is_same_v<ElementAccum, bhalf_t>))
+        __builtin_hcu_sched_barrier(0);
 
     }
 else if constexpr (STAGE == 1){
 ;
 }
 
+};
+
+for (; kloop < k_loop_count - 1; kloop++) {
+    compute_kloop(std::true_type{});
+}
+if (k_loop_count > 0) {
+    compute_kloop(std::false_type{});
 }
     }
 
@@ -674,7 +772,8 @@ template<
   int STAGES,
   int N_LOOP_NUM = 4,
   bool DIRECT_DWORDX4 = false,
-  bool PERSISTENT = false>
+  bool PERSISTENT = false,
+  bool LDS_ONLY_REUSE = false>
 __global__ void __launch_bounds__(256,1) DEEPGEMM_W4A8_I8_PERCHANNEL_MARLIN_HIP_NT_MASKED(
   const Element* __restrict__ input,
   const Element* __restrict__ qweight,
@@ -691,7 +790,9 @@ __global__ void __launch_bounds__(256,1) DEEPGEMM_W4A8_I8_PERCHANNEL_MARLIN_HIP_
   uint32_t stride_bsn, 
   uint32_t stride_bsk,
   uint32_t experts,
-  uint32_t blocks_per_expert
+  uint32_t blocks_per_expert,
+  bool enable_overlap,
+  int32_t* signal
 ) {
 
   int bidy = 0;
@@ -704,6 +805,10 @@ __global__ void __launch_bounds__(256,1) DEEPGEMM_W4A8_I8_PERCHANNEL_MARLIN_HIP_
   int scan_expert = 0;
   int scan_last_expert_end = 0;
   bool static_done = false;
+  // signal 槽位按 64 行粒度组织（E * ceil(M/64)）；block_m<64 时
+  // 一个槽位聚合 64/block_m 个 m tile 的完成计数。
+  const int m_bands_per_expert = DIVIDE(size_m, 64);
+  constexpr int kTilesPerBand = 64 / BLOCK_SIZE_M;
 
   while (true) {
     if constexpr (PERSISTENT) {
@@ -818,7 +923,9 @@ constexpr int store_size = WARP_M  / 4;
   auto g_weight_scale = weight_scale + weight_scale_offset;
     
   float b_scale_dwordx4[n_loop_num][8];
-  if constexpr (DIRECT_DWORDX4) {
+  constexpr bool defer_b_scale = DIRECT_DWORDX4 && !PERSISTENT &&
+                                 std::is_same_v<scalar_t, bhalf_t>;
+  auto load_b_scale = [&]() {
     #pragma unroll
     for(int n_loop=0;n_loop < n_loop_num;n_loop++){
       const int scale_base = weight_scale_offset + BLOCK_SIZE_N * n_loop +
@@ -828,6 +935,9 @@ constexpr int store_size = WARP_M  / 4;
         b_scale_dwordx4[n_loop][i] = weight_scale[scale_base + i];
       }
     }
+  };
+  if constexpr (DIRECT_DWORDX4 && !defer_b_scale) {
+    load_b_scale();
   }
 
    
@@ -840,9 +950,14 @@ constexpr int store_size = WARP_M  / 4;
       
 
       constexpr int SIZE_K = 0;
-      gemm_nt_marlin_prefill_w4a8<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, SIZE_K, Element, scalar_t, N_LOOP_NUM, DIRECT_DWORDX4>
-      (g_input, g_qweight, input_lds, qweight_lds, input_scale, g_weight_scale, size_m, A_reg, B_reg, C_reg, warp_id, size_k, size_k, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, expert_id, block_in_expert);
+      gemm_nt_marlin_prefill_w4a8<false, 0, 0, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K, STAGES, GROUP_N, GROUP_K, SIZE_K, Element, scalar_t, N_LOOP_NUM, DIRECT_DWORDX4, LDS_ONLY_REUSE>
+      (g_input, g_qweight, input_lds, qweight_lds, input_scale, g_weight_scale, size_m, valid_m, A_reg, B_reg, C_reg, warp_id, size_k, size_k, stride_asm, stride_ask, stride_bse, stride_bsn, stride_bsk, expert_id, block_in_expert);
     __builtin_hcu_sched_barrier(0);
+    if constexpr (defer_b_scale) {
+      // Keep the epilogue scales out of registers during the K loop.
+      asm volatile("" ::: "memory");
+      load_b_scale();
+    }
     
 
     
@@ -859,6 +974,18 @@ constexpr int store_size = WARP_M  / 4;
         const int tile_idx = min_tile_m * (WARP_N / mfma_n);
         #pragma unroll
         for(int reg_id =0; reg_id < 4 ; reg_id ++){
+#if defined(__gfx938__)
+          if constexpr (WARP_M == 128 && std::is_same_v<scalar_t, bhalf_t>) {
+            const float lo = static_cast<float>(C_reg[n_loop][tile_idx][reg_id]) *
+                             a_scale_value * b_scale_dwordx4[n_loop][reg_id * 2];
+            const float hi = static_cast<float>(C_reg[n_loop][tile_idx + 1][reg_id]) *
+                             a_scale_value * b_scale_dwordx4[n_loop][reg_id * 2 + 1];
+            auto pair = __builtin_hcu_cvt_pk_bf16_f32(lo, hi, false);
+            reinterpret_cast<uint32_t*>(&packed_store_value.data)[reg_id] =
+                *reinterpret_cast<uint32_t*>(&pair);
+          } else
+#endif
+          {
           #pragma unroll
           for (int pair_id = 0; pair_id < 2; pair_id++) {
             const int acc = C_reg[n_loop][tile_idx + pair_id][reg_id];
@@ -867,6 +994,7 @@ constexpr int store_size = WARP_M  / 4;
                                  b_scale_dwordx4[n_loop][reg_id * 2 + pair_id];
             packed_store_value.data[reg_id * 2 + pair_id] =
                 b32_to_b16<scalar_t>(scaled);
+          }
           }
         }
         const int n_index = BLOCK_SIZE_N * n_loop + warp_id * WARP_N + col_id * 8;
@@ -959,10 +1087,32 @@ constexpr int store_size = WARP_M  / 4;
         }
       }
     }
+
+    if (enable_overlap) {
+      vmcnt_only_wait(0);
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        constexpr int kNLoopBlockN = BLOCK_SIZE_N * N_LOOP_NUM;
+        int* slot = signal + expert_id * m_bands_per_expert
+                            + block_in_expert / kTilesPerBand;
+        // 该 64 行带内实际存在的 tile 数：除末带外恒为 kTilesPerBand。
+        const int expert_tiles = DIVIDE(valid_m, BLOCK_SIZE_M);
+        const int band_id = block_in_expert / kTilesPerBand;
+        const int band_tiles = (expert_tiles - band_id * kTilesPerBand) < kTilesPerBand
+                                   ? (expert_tiles - band_id * kTilesPerBand)
+                                   : kTilesPerBand;
+        const int old = atomicAdd(slot, 1);
+        if (old + 1 == band_tiles * DIVIDE(size_n, kNLoopBlockN)) {
+          // 末带不满 64 行（valid_m 非 64 倍数）时补齐差额，使每个活跃槽位
+          // 的终值统一为 (64/block_m) * ceil_div(N, block_n)。
+          atomicAdd(slot, (kTilesPerBand - band_tiles) * DIVIDE(size_n, kNLoopBlockN));
+        }
+      }
+    }
   }
 }
 
-template<int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden, int N_LOOP_NUM, bool DIRECT_DWORDX4, bool PERSISTENT = false>
+template<int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, typename T, typename T_hidden, int N_LOOP_NUM, bool DIRECT_DWORDX4, bool PERSISTENT = false, bool LDS_ONLY_REUSE = false>
 void launch_w4a8_hipc_masked_prefill_kernel(
     const GemmParams_w4a8<T,T_hidden>& params) {
     const int WARP_NUM = (BLOCK_SIZE_N / WARP_N) * (BLOCK_SIZE_K / WARP_K);
@@ -972,7 +1122,6 @@ void launch_w4a8_hipc_masked_prefill_kernel(
     dim3 blockDim(WARP_NUM * 64, 1, 1);
     dim3 gridDim;
     if constexpr (PERSISTENT) {
-      const int n_blocks = DIVIDE(params.size_n, BLOCK_SIZE_N * n_loop_num);
       int device = 0;
       hipDeviceProp_t device_properties;
       DG_HIP_CHECK(hipGetDevice(&device));
@@ -982,13 +1131,13 @@ void launch_w4a8_hipc_masked_prefill_kernel(
         const int env_cus = std::strtol(env, nullptr, 10);
         if (env_cus > 0) hcu_cus = env_cus;
       }
-      int persistent_multiplier = 2;
+      int persistent_multiplier =
+          params.persistent_multiplier > 0 ? params.persistent_multiplier : 2;
       if (const char* env = std::getenv("DEEPGEMM_W4A8_MASKED_PERSISTENT_MULT")) {
         const int env_multiplier = std::strtol(env, nullptr, 10);
         if (env_multiplier > 0) persistent_multiplier = env_multiplier;
       }
-      const int persistent_thread_blocks =
-          std::lcm(n_blocks, hcu_cus) * persistent_multiplier;
+      const int persistent_thread_blocks = hcu_cus * persistent_multiplier;
       gridDim = dim3(persistent_thread_blocks, 1, 1);
     } else {
       gridDim = dim3(1, DIVIDE(params.size_n, BLOCK_SIZE_N * n_loop_num),
@@ -998,7 +1147,7 @@ void launch_w4a8_hipc_masked_prefill_kernel(
     const hipStream_t stream = at::cuda::getCurrentHIPStream();
 
     DEEPGEMM_W4A8_I8_PERCHANNEL_MARLIN_HIP_NT_MASKED<T_hidden,char, WARP_NUM, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WARP_M, WARP_N, WARP_K,
-    GROUP_N, GROUP_K, STAGES, N_LOOP_NUM, DIRECT_DWORDX4, PERSISTENT><<<gridDim, blockDim, shared_mem_size, stream>>>(
+    GROUP_N, GROUP_K, STAGES, N_LOOP_NUM, DIRECT_DWORDX4, PERSISTENT, LDS_ONLY_REUSE><<<gridDim, blockDim, shared_mem_size, stream>>>(
     params.ptr_A,
     params.ptr_B0,
     params.ptr_C,
@@ -1014,14 +1163,16 @@ void launch_w4a8_hipc_masked_prefill_kernel(
     params.stride_bsn,
     params.stride_bsk,
     params.experts,
-    params.blocks_per_expert);
+    params.blocks_per_expert,
+    params.enable_overlap,
+    params.signal);
 }
 
 namespace deepgemm {
 
 constexpr int kW4A8HipcBlockM = 64;
 
-template <int BLOCK_SIZE_M, int N_LOOP_NUM, typename scalar_t>
+template <int BLOCK_SIZE_M, int N_LOOP_NUM, typename scalar_t, bool LDS_ONLY_REUSE = false>
 void launch_w4a8_hipc_masked_persistent(
     const torch::Tensor& input,
     const torch::Tensor& b_qweight,
@@ -1032,7 +1183,10 @@ void launch_w4a8_hipc_masked_persistent(
     int experts,
     int size_m,
     int size_n,
-    int size_k) {
+    int size_k,
+    int persistent_multiplier,
+    bool enable_overlap,
+    int32_t* signal) {
   const int persistent_blocks_per_expert = DIVIDE(size_m, BLOCK_SIZE_M);
   GemmParams_w4a8<char, scalar_t> persistent_params(
       reinterpret_cast<const char*>(input.data_ptr<int8_t>()),
@@ -1050,15 +1204,18 @@ void launch_w4a8_hipc_masked_persistent(
       b_scale.stride(0),
       b_scale.stride(1),
       b_scale.stride(2),
-      persistent_blocks_per_expert);
+      persistent_blocks_per_expert,
+      persistent_multiplier,
+      enable_overlap,
+      signal);
   launch_w4a8_hipc_masked_prefill_kernel<
       BLOCK_SIZE_M, 128, 64, BLOCK_SIZE_M, 32, 64, 2,
-      char, scalar_t, N_LOOP_NUM, true, true>(
+      char, scalar_t, N_LOOP_NUM, true, true, LDS_ONLY_REUSE>(
           persistent_params);
 }
 
 template <typename scalar_t>
-void launch_w4a8_hipc_masked_prefill(
+std::pair<int, int> launch_w4a8_hipc_masked_prefill(
     const torch::Tensor& input,
     const torch::Tensor& b_qweight,
     torch::Tensor& output,
@@ -1066,7 +1223,10 @@ void launch_w4a8_hipc_masked_prefill(
     const torch::Tensor& b_scale,
     const torch::Tensor& masked_m,
     int direct_blocks_per_expert,
-    int mode) {
+    int mode,
+    int persistent_multiplier,
+    bool enable_overlap,
+    int32_t* signal) {
   const int experts = input.size(0);
   const int size_m = input.size(1);
   const int size_k = input.size(2);
@@ -1088,74 +1248,120 @@ void launch_w4a8_hipc_masked_prefill(
       b_scale.stride(0),
       b_scale.stride(1),
       b_scale.stride(2),
-      direct_blocks_per_expert);
+      direct_blocks_per_expert,
+      0,
+      enable_overlap,
+      signal);
 
+  // 如果block_m小于64
+  // 返回{64, (64/block_m) * (size_n / (block_n * n_loop_num))}
+  // 每次完成一个`(block_m, block_n×nloop)` tile 的写回显存时，
+  // 对signal[e*ceil_div(M/64)+m64]原子加一
+  // valid_m 不满 64 行时（末带实际 tile 数少于 64/block_m），内核在末带
+  // 数据写完时补齐差额
+  // 如果block_m大于等于64
+  // 返回{block_m, size_n / (block_n * n_loop_num)}
+  // 每次完成一个`(block_m, block_n×nloop)` tile 的写回显存时，
+  // 对signal[e*ceil_div(M/block_m)+m]原子加一
   if (mode == 1002 || mode == 1644) {
     launch_w4a8_hipc_masked_prefill_kernel<
         64, 128, 64, 64, 32, 64, 2, char, scalar_t, 4, true, false>(params);
+    return {64, DIVIDE(size_n, 128 * 4)};
+  } else if (mode == 2282) {
+    // A 128-row tile reuses each packed B tile across twice as many rows.
+    params.blocks_per_expert = DIVIDE(size_m, 128);
+    launch_w4a8_hipc_masked_prefill_kernel<
+        128, 128, 64, 128, 32, 64, 2, char, scalar_t, 2, true, false>(params);
+    return {64, DIVIDE(size_n, 128 * 2)};
   } else if (mode == 1003 || mode == 1161) {
     launch_w4a8_hipc_masked_persistent<16, 1, scalar_t>(
         input, b_qweight, output, a_scale, b_scale, masked_m,
-        experts, size_m, size_n, size_k);
+        experts, size_m, size_n, size_k, persistent_multiplier,
+        enable_overlap, signal);
+    return {64, 4 * DIVIDE(size_n, 128 * 1)};
   } else if (mode == 1016 || mode == 1162) {
     launch_w4a8_hipc_masked_persistent<16, 2, scalar_t>(
         input, b_qweight, output, a_scale, b_scale, masked_m,
-        experts, size_m, size_n, size_k);
+        experts, size_m, size_n, size_k, persistent_multiplier,
+        enable_overlap, signal);
+    return {64, 4 * DIVIDE(size_n, 128 * 2)};
   } else if (mode == 1017 || mode == 1164) {
     launch_w4a8_hipc_masked_persistent<16, 4, scalar_t>(
         input, b_qweight, output, a_scale, b_scale, masked_m,
-        experts, size_m, size_n, size_k);
+        experts, size_m, size_n, size_k, persistent_multiplier,
+        enable_overlap, signal);
+    return {64, 4 * DIVIDE(size_n, 128 * 4)};
   } else if (mode == 1031 || mode == 1321) {
     launch_w4a8_hipc_masked_persistent<32, 1, scalar_t>(
         input, b_qweight, output, a_scale, b_scale, masked_m,
-        experts, size_m, size_n, size_k);
+        experts, size_m, size_n, size_k, persistent_multiplier,
+        enable_overlap, signal);
+    return {64, 2 * DIVIDE(size_n, 128 * 1)};
   } else if (mode == 1032 || mode == 1322) {
     launch_w4a8_hipc_masked_persistent<32, 2, scalar_t>(
         input, b_qweight, output, a_scale, b_scale, masked_m,
-        experts, size_m, size_n, size_k);
+        experts, size_m, size_n, size_k, persistent_multiplier,
+        enable_overlap, signal);
+    return {64, 2 * DIVIDE(size_n, 128 * 2)};
   } else if (mode == 1034 || mode == 1324) {
     launch_w4a8_hipc_masked_persistent<32, 4, scalar_t>(
         input, b_qweight, output, a_scale, b_scale, masked_m,
-        experts, size_m, size_n, size_k);
+        experts, size_m, size_n, size_k, persistent_multiplier,
+        enable_overlap, signal);
+    return {64, 2 * DIVIDE(size_n, 128 * 4)};
   } else if (mode == 1061 || mode == 1641) {
     launch_w4a8_hipc_masked_persistent<64, 1, scalar_t>(
         input, b_qweight, output, a_scale, b_scale, masked_m,
-        experts, size_m, size_n, size_k);
+        experts, size_m, size_n, size_k, persistent_multiplier,
+        enable_overlap, signal);
+    return {64, DIVIDE(size_n, 128 * 1)};
   } else if (mode == 1062 || mode == 1642) {
     launch_w4a8_hipc_masked_persistent<64, 2, scalar_t>(
         input, b_qweight, output, a_scale, b_scale, masked_m,
-        experts, size_m, size_n, size_k);
+        experts, size_m, size_n, size_k, persistent_multiplier,
+        enable_overlap, signal);
+    return {64, DIVIDE(size_n, 128 * 2)};
+  } else if (mode == 1070){
+    m_grouped_w4a8_gemm_nt_masked_pair32_bm128_bn256_bk128::launch(
+            input, b_qweight, a_scale, b_scale, masked_m, output,
+            enable_overlap, signal);
+    return {128, DIVIDE(size_n, 256)};
   } else {
     TORCH_CHECK(false, mode, " mode error.");
   }
 }
 
-void launch_m_grouped_w4a8_hipc_masked_fastpath(
+std::pair<int, int> launch_m_grouped_w4a8_hipc_masked_fastpath(
     torch::Tensor input,
     torch::Tensor b_qweight,
     torch::Tensor output,
     torch::Tensor a_scale,
     torch::Tensor b_scale,
     torch::Tensor masked_m,
-    int mode) {
+    int mode,
+    int persistent_multiplier,
+    bool enable_overlap,
+    int32_t* signal) {
   const int size_m = input.size(1);
   const int blocks_per_expert = DIVIDE(size_m, kW4A8HipcBlockM);
 
+  std::pair<int, int> batch_m_and_done_threshold;
   if (output.scalar_type() == at::ScalarType::BFloat16) {
-    launch_w4a8_hipc_masked_prefill<bhalf_t>(
+    batch_m_and_done_threshold = launch_w4a8_hipc_masked_prefill<bhalf_t>(
         input, b_qweight, output, a_scale, b_scale, masked_m,
-        blocks_per_expert, mode);
+        blocks_per_expert, mode, persistent_multiplier, enable_overlap, signal);
   } else if (output.scalar_type() == at::ScalarType::Half) {
-    launch_w4a8_hipc_masked_prefill<half_t>(
+    batch_m_and_done_threshold = launch_w4a8_hipc_masked_prefill<half_t>(
         input, b_qweight, output, a_scale, b_scale, masked_m,
-        blocks_per_expert, mode);
+        blocks_per_expert, mode, persistent_multiplier, enable_overlap, signal);
   } else {
     TORCH_CHECK(false, "HIPC W4A8 fastpath supports fp16/bf16 output only");
   }
   DG_HIP_CHECK(hipGetLastError());
+  return batch_m_and_done_threshold;
 }
 
-torch::Tensor m_grouped_marlin_w4a8_gemm_nt_masked_hipc(
+std::tuple<int64_t, int64_t> m_grouped_marlin_w4a8_gemm_nt_masked_hipc(
   torch::Tensor input,
   torch::Tensor b_qweight,
   torch::Tensor output,
@@ -1163,18 +1369,36 @@ torch::Tensor m_grouped_marlin_w4a8_gemm_nt_masked_hipc(
   torch::Tensor b_scale,
   torch::Tensor masked_m,
   int expected_m_per_group,
-  int mode) {
+  int mode,
+  int persistent_multiplier,
+  bool enable_overlap,
+  const c10::optional<torch::Tensor>& signal) {
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   TORCH_CHECK(
       mode == 1002 || mode == 1003 || mode == 1016 || mode == 1017 ||
           mode == 1031 || mode == 1032 || mode == 1034 ||
-          mode == 1061 || mode == 1062 ||
+          mode == 1061 || mode == 1062 || mode == 1070 ||
           mode == 1161 || mode == 1162 || mode == 1164 ||
           mode == 1321 || mode == 1322 || mode == 1324 ||
-          mode == 1641 || mode == 1642 || mode == 1644,
+          mode == 1641 || mode == 1642 || mode == 1644 || mode == 2282 ,
       mode, " mode error.");
+
+  int32_t* signal_ptr = nullptr;
+  if (enable_overlap) {
+    // signal 槽位按 64 行粒度组织：signal[e * ceil(M/64) + m64]。
+    // block_m<64 的内核将 64/block_m 个 m tile 聚合进同一槽位，
+    // 槽位终值统一为 (64/block_m) * ceil_div(N, block_n)。
+    TORCH_CHECK(signal.has_value() && signal->defined() && signal->is_cuda() &&
+                    signal->scalar_type() == at::kInt && signal->is_contiguous(),
+                "signal must be a contiguous CUDA int32 tensor");
+    TORCH_CHECK(signal->numel() >=
+                    static_cast<int64_t>(input.size(0)) *
+                        ((input.size(1) + 63) / 64),
+                "signal must have at least E * ceil(M/64) elements");
+    signal_ptr = signal->data_ptr<int32_t>();
+  }
   TORCH_CHECK(input.is_cuda() && b_qweight.is_cuda() && output.is_cuda() &&
                   a_scale.is_cuda() && b_scale.is_cuda() && masked_m.is_cuda(),
               "m_grouped_marlin_w4a8_gemm_nt_masked_hipc expects CUDA tensors");
@@ -1205,13 +1429,17 @@ torch::Tensor m_grouped_marlin_w4a8_gemm_nt_masked_hipc(
                   a_scale.is_contiguous() && b_scale.is_contiguous() && masked_m.is_contiguous(),
               "all tensors must be contiguous");
 
-  launch_m_grouped_w4a8_hipc_masked_fastpath(
+  const auto batch_m_and_done_threshold = launch_m_grouped_w4a8_hipc_masked_fastpath(
       input, b_qweight, output, a_scale, b_scale, masked_m,
-      mode);
+      mode, persistent_multiplier, enable_overlap, signal_ptr);
   DG_HIP_CHECK(hipGetLastError());
-  return output;
+  return std::make_tuple(
+      batch_m_and_done_threshold.first,
+      batch_m_and_done_threshold.second);
 }
 
 
 
 }
+
+}  // namespace gfx936_gfx938_shared

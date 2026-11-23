@@ -49,17 +49,6 @@ namespace deepgemm
         return (a + b - 1) / b;
       }
 
-      __device__ __forceinline__ int atomic_add_release_global(const int *ptr, int value)
-      {
-        int ret;
-#ifdef USE_ROCM
-        ret = __hip_atomic_fetch_add(const_cast<int *>(ptr), value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#else
-        asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
-#endif
-        return ret;
-      }
-
 #define MOE_LL_K_SWITCH(k, ...)                                             \
   [&] {                                                                     \
     if (k == 1024) {                                                        \
@@ -70,6 +59,9 @@ namespace deepgemm
       return __VA_ARGS__();                                                 \
     } else if (k == 2048) {                                                 \
       constexpr static int K = 2048;                                        \
+      return __VA_ARGS__();                                                 \
+    } else if (k == 2304) {                                                 \
+      constexpr static int K = 2304;                                        \
       return __VA_ARGS__();                                                 \
     } else if (k == 3072) {                                                 \
       constexpr static int K = 3072;                                        \
@@ -132,50 +124,6 @@ namespace deepgemm
     }                                                                       \
   }();
 
-#define MOE_LL_OVERLAP_SWITCH(overlap, ...)                                 \
-  [&] {                                                                     \
-    if (overlap == true) {                                                  \
-      constexpr static bool SBO = true;                                     \
-      return __VA_ARGS__();                                                 \
-    } else {                                                                \
-      constexpr static bool SBO = false;                                    \
-      return __VA_ARGS__();                                                 \
-    }                                                                       \
-  }();
-
-#define MOE_LL_CU_SWITCH(cu, ...)                                           \
-  [&] {                                                                     \
-    if (cu == 64) {                                                         \
-      constexpr static int CUs = 64;                                        \
-      return __VA_ARGS__();                                                 \
-    } else if (cu == 72) {                                                  \
-      constexpr static int CUs = 72;                                        \
-      return __VA_ARGS__();                                                 \
-    } else if (cu == 128) {                                                 \
-      constexpr static int CUs = 128;                                       \
-      return __VA_ARGS__();                                                 \
-    } else if (cu == 144) {                                                 \
-      constexpr static int CUs = 144;                                       \
-      return __VA_ARGS__();                                                 \
-    } else if (cu == 192) {                                                 \
-      constexpr static int CUs = 192;                                       \
-      return __VA_ARGS__();                                                 \
-    } else if (cu == 216) {                                                 \
-      constexpr static int CUs = 216;                                       \
-      return __VA_ARGS__();                                                 \
-    } else if (cu == 256) {                                                 \
-      constexpr static int CUs = 256;                                       \
-      return __VA_ARGS__();                                                 \
-    } else if (cu == 288) {                                                 \
-      constexpr static int CUs = 288;                                       \
-      return __VA_ARGS__();                                                 \
-    } else {                                                                \
-      std::cout << "unsupported low latency cu " << cu << std::endl;        \
-    }                                                                       \
-  }();
-
     } // end namespace MASKED_UTILS
 
 } // end namespace DEEP_GEMM
-
-

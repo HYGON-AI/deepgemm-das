@@ -7,7 +7,7 @@ import sys
 
 import torch
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = "/home/work/repo_deepgemm/deepgemm"
 for path in [REPO_ROOT, os.path.join(REPO_ROOT, "op_test")]:
     if path not in sys.path:
         sys.path.insert(0, path)
@@ -238,7 +238,7 @@ def main():
         names = DEFAULT_CASES
     else:
         names = [args.case]
-    print(f"using DeepGEMM source tree, big tile mode={MODE_BIG_TILE}, SIZE_M={SIZE_M}, cases={len(names)}")
+    print(f"using repo_deepgemm big tile mode={MODE_BIG_TILE}, SIZE_M={SIZE_M}, cases={len(names)}")
     results = []
     for name in names:
         results.append(run_case(CASES[name], args.warmup, args.iters, not args.skip_correctness, args.verbose))
